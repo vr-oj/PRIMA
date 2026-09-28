@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import numpy as np
 from PyQt5.QtCore import (
     Qt,
@@ -42,6 +43,7 @@ from tifffile import TiffFile, imwrite
 from PIL import Image
 
 from utils.recording_csv import load_pressure_values
+from cameras.pixels import display_gray
 
 
 class OverlayItem(QGraphicsItem):
@@ -120,7 +122,16 @@ class PlaybackLoader(QObject):
             with TiffFile(self.tiff_path) as tif:
                 total = len(tif.pages)
                 for idx, page in enumerate(tif.pages):
-                    frame = page.asarray()
+                    depth = None
+                    try:
+                        metadata = json.loads(page.description or "{}")
+                        if isinstance(metadata, dict):
+                            depth = metadata.get("source_bit_depth")
+                    except (ValueError, TypeError):
+                        pass
+                    # Playback/annotated exports keep the established 8-bit
+                    # grayscale display. The source TIFF retains native pixels.
+                    frame = display_gray(page.asarray(), depth)
                     pressure = pressures[idx] if idx < len(pressures) else 0
                     self.frame_loaded.emit(idx, frame, pressure, total)
                     self.progress.emit(idx + 1, total)

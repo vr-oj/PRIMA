@@ -1,7 +1,7 @@
 # PRIMA
 
-PRIMA records synchronized pressure data from the Arduino-controlled PRIM
-device and live camera imagery from The Imaging Source DMK cameras. Recordings
+PRIMA 3.5.0 records pressure data from the Arduino-controlled PRIM
+device and camera imagery through native IC4 or Micro-Manager connections. Recordings
 are saved as CSV pressure logs and, when enabled, TIFF video stacks for playback
 and analysis.
 
@@ -12,17 +12,41 @@ and analysis.
 2. Install PRIMA using the Windows installer from the latest release.
 3. Connect the PRIM device over USB and select its COM port.
 4. Select the camera and resolution, then click **Start Camera**.
-5. In the camera controls, select the recording **Frame Rate (fps)** and
-   **Capture** setting.
+5. In the Recording panel, select **Pressure rate** and **Images**.
 6. Click **Start Recording**.
 7. Click **Stop Recording** when finished.
 8. Use **Playback Last Recording** to review the TIFF/CSV output.
 
+For a non-IC4 camera, choose **Micro-Manager Camera Setup…** at the end of the
+Camera dropdown. Install compatible Micro-Manager adapters and the camera's
+vendor drivers, then find the camera or load a saved configuration. See the
+[camera setup guide](prim_app/docs/cameras.md). Supported camera/adapter pairs can
+preview and record with Arduino electrical triggers; unsupported trigger
+interfaces cannot start a video recording. There is no automatic software-sync
+fallback. IC4 and Micro-Manager are optional at application startup.
+
+Starting a recording clears the previous live plot. After the files and camera
+are ready, PRIMA sends **Zero (`Z`) → Start (`G`)** so each recording begins with
+a fresh Arduino clock and trigger counter. Zero does not change pressure
+calibration. The plot uses the original device timestamps, just like the saved
+CSV/TIFF data; there is no display-only time offset. The completed plot remains
+available for inspection/export until the next recording or an explicit clear.
+
+After recording with **Images: None**, restart the Arduino box and match its
+FPS/Capture configuration to the next recording request. Selecting None displays
+this reminder beneath Images. PRIM firmware remains unchanged; Zero resets the
+public clock and trigger count and does not replace the required restart.
+
+Changing **Preview rate** briefly pauses camera acquisition, applies the rate
+through IC4, and resumes preview. Recording becomes available after a new image
+arrives. A rejected rate restores the previous preview configuration. Preview
+rate controls remain locked during recording, when Arduino pulses govern capture.
+
 ## Recording Controls
 
-PRIMA is the source of truth for recording timing once recording starts. The
-Frame Rate and Capture controls in the app are sent to the Arduino whenever
-PRIMA sends start, stop, or zero commands.
+Set the pressure sampling rate and image capture in PRIMA before recording.
+The **Pressure rate** and **Images** values are sent to the Arduino whenever
+PRIMA sends start, stop, or zero commands. Both controls are locked during a run.
 
 The command format is:
 
@@ -101,9 +125,10 @@ frameIdx,deviceTime,pressure,tiffFrame
 ```
 
 The `tiffFrame` column marks which pressure rows were saved to the TIFF stack.
-For Capture **Every**, every row has a TIFF frame number. For Capture
-**1 in 10**, rows 10, 20, 30, and so on are marked. For Capture **None**, the
-column is blank and no TIFF file is written.
+For Capture **Every**, every successfully matched row has a TIFF frame number.
+For Capture **1 in 10**, rows associated with an actual trigger-counter increment
+are marked; the first pulse depends on the firmware's retained divider phase.
+For Capture **None**, the column is blank and no TIFF file is written.
 
 Playback supports both older CSV files and the newer metadata-prefixed CSV
 files.
@@ -113,7 +138,7 @@ files.
 End users should install PRIMA from the release installer:
 
 ```text
-PRIMA-Setup-3.0.0.exe
+PRIMA-Setup-3.5.0.exe
 ```
 
 Prerequisites:
@@ -159,7 +184,7 @@ installer\build_installer.bat
 The installer output is:
 
 ```text
-installer\output\PRIMA-Setup-3.0.0.exe
+installer\output\PRIMA-Setup-3.5.0.exe
 ```
 
 If the PyInstaller build succeeds but the script cannot find Inno Setup, compile

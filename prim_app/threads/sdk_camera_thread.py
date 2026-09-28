@@ -1,284 +1,304 @@
-# File: prim_app/threads/sdk_camera_thread.py
-
+"""IC4 acquisition and property access owned by one worker thread."""
 import logging
+import math
+import queue
+import time
+
 import imagingcontrol4 as ic4
 import numpy as np
-
-from utils.config import DEFAULT_FPS
-
 from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
+
+from utils.camera_trigger import TriggerProfile, checked
+from utils.camera_access import require_no_other_prima
 
 log = logging.getLogger(__name__)
 
 
+class PreviewRecoveryError(RuntimeError):
+    """A control change failed and the previous preview could not be restored."""
+
+
 class SDKCameraThread(QThread):
-    """
-    Opens the camera (using the DeviceInfo + resolution passed in via set_* methods),
-    then starts a QueueSink-based stream. Each new frame is emitted as a QImage via
-    frame_ready(QImage, buffer). When stop() is called, stops streaming and closes the device.
-    """
-
-    # Emitted once the grabber is open (but before streaming starts).
     grabber_ready = pyqtSignal()
-
-    # Emitted for each new frame: (QImage, raw_buffer_object)
     frame_ready = pyqtSignal(QImage, object)
-
-    # Emitted on error: (message, code_as_string)
+    recording_frame_ready = pyqtSignal(QImage, object)
     error = pyqtSignal(str, str)
+    settings_ready = pyqtSignal(object)
+    timing_ready = pyqtSignal(str, object)
+    timing_failed = pyqtSignal(str, str)
+    preview_ready = pyqtSignal()
+    control_error = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.grabber = None
+        self.grabber = self._sink = self._profile = None
+        self._device_info = self._resolution = None
         self._stop_requested = False
+        self._streaming = False
+        self._deliver = False
+        self._run_id = None
+        self._commands = queue.Queue()
+        self._last_preview_emit = 0.0
+        self._last_preview_frame = 0.0
+        self._preview_timeout_s = 6.0
+        self._preview_announced = self._grabber_announced = False
+        self.capture_statistics = []
 
-        # Will be set by MainWindow before start():
-        self._device_info = None  # an ic4.DeviceInfo instance
-        self._resolution = None  # tuple (width, height, pixel_format_name)
+    def set_device_info(self, info):
+        self._device_info = info
 
-        # Keep a reference to the sink so we can stop it later
-        self._sink = None
+    def set_resolution(self, resolution):
+        self._resolution = resolution
 
-    def set_device_info(self, dev_info):
-        self._device_info = dev_info
+    def request_setting(self, name, value):
+        self._commands.put(("setting", (name, value)))
 
-    def set_resolution(self, resolution_tuple):
-        # resolution_tuple is (w, h, pf_name), e.g. (2448, 2048, "Mono8")
-        self._resolution = resolution_tuple
+    def request_recording(self, run_id, interval_s):
+        self._commands.put(("record", (run_id, interval_s)))
+
+    def request_preview(self):
+        self._commands.put(("preview", None))
+
+    def _start_stream(self):
+        if self._sink is None:
+            self._sink = ic4.QueueSink(self, [ic4.PixelFormat.Mono8], max_output_buffers=16)
+        self.grabber.stream_setup(self._sink, setup_option=ic4.StreamSetupOption.ACQUISITION_START)
+        self._streaming = True
+
+    def _stop_stream(self):
+        self._deliver = False
+        if self._streaming:
+            if self._run_id is not None:
+                try:
+                    stats = self.grabber.stream_statistics
+                    sizes = self._sink.queue_sizes()
+                    self.capture_statistics.append({
+                        "run_id": self._run_id, "device_delivered": stats.device_delivered,
+                        "device_transmission_error": stats.device_transmission_error,
+                        "device_underrun": stats.device_underrun, "sink_delivered": stats.sink_delivered,
+                        "sink_underrun": stats.sink_underrun, "sink_ignored": stats.sink_ignored,
+                        "free_buffers": sizes.free_queue_length, "queued_buffers": sizes.output_queue_length,
+                        "camera_readback": {name: node.value for name, node, value in self._profile.expected}})
+                except Exception as exc:
+                    self.capture_statistics.append({"run_id": self._run_id, "error": str(exc)})
+            self.grabber.stream_stop()
+            self._streaming = False
+
+    def _snapshot(self):
+        props = self.grabber.device_property_map
+        result = {}
+        for name in ("ExposureTime", "Gain", "AcquisitionFrameRate"):
+            try:
+                node = props.find_float(name)
+                result[name] = {"value": node.value, "minimum": node.minimum,
+                                "maximum": node.maximum, "unit": node.unit}
+            except Exception as exc:
+                result[name] = {"error": str(exc)}
+        for name in ("ExposureAuto", "GainAuto", "PixelFormat"):
+            try:
+                node = props.find_enumeration(name)
+                result[name] = {"value": node.value, "choices": [e.name for e in node.entries]}
+            except Exception as exc:
+                result[name] = {"error": str(exc)}
+        periods = [2.0]
+        rate = result.get("AcquisitionFrameRate", {}).get("value")
+        exposure = result.get("ExposureTime", {}).get("value")
+        if rate is not None and math.isfinite(rate) and rate > 0:
+            periods.append(1.0 / rate)
+        if exposure is not None and math.isfinite(exposure) and exposure > 0:
+            periods.append(exposure / 1_000_000.0)
+        self._preview_timeout_s = 3 * max(periods)
+        self.settings_ready.emit(result)
+
+    def _resume_preview_stream(self):
+        self._preview_announced = False
+        self._last_preview_frame = time.monotonic()
+        self._start_stream()
+        self._deliver = True
+
+    def _preview(self):
+        self._stop_stream()
+        if self._profile:
+            self._profile.restore()
+            self._profile = None
+        self._run_id = None
+        checked(self.grabber.device_property_map.find_enumeration("TriggerMode"), "Off", "TriggerMode")
+        self._resume_preview_stream()
+        self._snapshot()
+
+    def _record(self, run_id, interval_s):
+        self._stop_stream()
+        self._profile = TriggerProfile(ic4, self.grabber.device_property_map)
+        try:
+            details = self._profile.prepare(interval_s)
+            self._run_id = run_id
+            self._start_stream()
+            self._profile.verify()
+            self._deliver = True
+            details.update(model=self._device_info.model_name, serial=self._device_info.serial)
+            self.timing_ready.emit(run_id, details)
+        except Exception as exc:
+            self.timing_failed.emit(run_id, str(exc))
+            self._preview()
+
+    def _setting(self, name, value):
+        if self._run_id is not None:
+            raise RuntimeError("Camera settings are locked until recording finishes")
+        props = self.grabber.device_property_map
+        if name in ("AcquisitionFrameRate", "PixelFormat"):
+            self._restart_preview_setting(name, value)
+        elif name in ("ExposureTime", "Gain"):
+            checked(props.find_float(name), float(value), name)
+        elif name in ("ExposureAuto", "GainAuto"):
+            checked(props.find_enumeration(name), value, name)
+        else:
+            raise ValueError(f"Unsupported camera control: {name}")
+
+    def _restart_preview_setting(self, name, value):
+        """Apply stream-affecting controls while stopped, restoring on failure."""
+        props = self.grabber.device_property_map
+        node = None
+        previous = None
+        try:
+            self._stop_stream()
+            if name == "AcquisitionFrameRate":
+                node, value = props.find_float(name), float(value)
+            else:
+                node = props.find_enumeration(name)
+            previous = node.value
+            checked(node, value, name)
+            self._resume_preview_stream()
+        except Exception as change_error:
+            try:
+                self._stop_stream()
+                if node is not None and previous is not None:
+                    checked(node, previous, name)
+                self._resume_preview_stream()
+            except Exception as restore_error:
+                raise PreviewRecoveryError(
+                    f"Could not change {name}: {change_error}. "
+                    f"Could not restore preview: {restore_error}") from restore_error
+            raise RuntimeError(
+                f"{name} was not applied: {change_error}. Previous preview restored.") from change_error
+
+    def _check_preview_timeout(self):
+        if time.monotonic() - self._last_preview_frame > self._preview_timeout_s:
+            raise RuntimeError("Camera preview is not delivering images; recording is unavailable")
 
     def run(self):
         try:
-            # ─── Initialize IC4 (with “already called” catch) ─────────────────
-            try:
-                ic4.Library.init(
-                    api_log_level=ic4.LogLevel.INFO, log_targets=ic4.LogTarget.STDERR
-                )
-                log.info("SDKCameraThread: Library.init() succeeded.")
-            except RuntimeError as e:
-                if "already called" in str(e):
-                    log.info("SDKCameraThread: IC4 already initialized; continuing.")
-                else:
-                    raise
-
-            # ─── Verify device_info was set ────────────────────────────────────
             if self._device_info is None:
-                raise RuntimeError("No DeviceInfo passed to SDKCameraThread.")
-
-            # ─── Open the grabber ───────────────────────────────────────────────
+                raise RuntimeError("No camera selected")
+            require_no_other_prima()
             self.grabber = ic4.Grabber()
             self.grabber.device_open(self._device_info)
-            log.info(
-                f"SDKCameraThread: device_open() succeeded for "
-                f"'{self._device_info.model_name}' (S/N '{self._device_info.serial}')."
-            )
-
-            # ─── Apply PixelFormat & resolution ────────────────────────────────
-
-            # ─── DEBUG: Log all available float properties ────────────────────
-            log.debug("Available float properties:")
-            for p in self.grabber.device_property_map:
-                try:
-                    val = p.get_value()
-                    log.debug(f"{p.identifier} = {val}")
-                except Exception:
-                    pass
-
-            # ─── Set Default Camera Properties BEFORE Streaming ───────────────
             props = self.grabber.device_property_map
-            try:
-                exp_prop = props.find_float("ExposureTime")
-                exp_prop.value = 10000.0  # Default to 10ms
-                log.info("Set ExposureTime to 10000 µs")
-            except Exception as e:
-                log.warning(f"Could not set ExposureTime: {e}")
-            try:
-                gain_prop = props.find_float("Gain")
-                gain_prop.value = 5.0
-                log.info("Set Gain to 5.0")
-            except Exception as e:
-                log.warning(f"Could not set Gain: {e}")
-            try:
-                fr_node = props.find_float("AcquisitionFrameRate")
-                if fr_node:
-                    fr_node.value = float(DEFAULT_FPS)
-                    log.info(
-                        f"SDKCameraThread: Set AcquisitionFrameRate = {DEFAULT_FPS}"
-                    )
-            except Exception as e:
-                log.warning(
-                    f"SDKCameraThread: Could not set AcquisitionFrameRate: {e}"
-                )
-
-            if self._resolution is not None:
-                w, h, pf_name = self._resolution
-                try:
-                    pf_node = self.grabber.device_property_map.find_enumeration(
-                        "PixelFormat"
-                    )
-                    if pf_node:
-                        pf_node.value = pf_name
-                        log.info(f"SDKCameraThread: Set PixelFormat = {pf_name}")
-                        w_node = self.grabber.device_property_map.find_integer("Width")
-                        h_node = self.grabber.device_property_map.find_integer("Height")
-                        if w_node and h_node:
-                            w_node.value = w
-                            h_node.value = h
-                            log.info(f"SDKCameraThread: Set resolution = {w}×{h}")
-                    else:
-                        log.warning(
-                            "SDKCameraThread: PixelFormat node not found; using default."
-                        )
-                except Exception as e:
-                    log.warning(f"SDKCameraThread: Could not set resolution/PF: {e}")
-
-            # ─── Enable Auto features by default ────────────────────────────
-
-            try:
-                ae_node = self.grabber.device_property_map.find_enumeration(
-                    "ExposureAuto"
-                )
-                if ae_node:
-                    ae_node.value = "Continuous"
-                    log.info("SDKCameraThread: Set ExposureAuto = Continuous")
-            except Exception as e:
-                log.warning(f"SDKCameraThread: Could not set ExposureAuto: {e}")
-
-            try:
-                ag_node = self.grabber.device_property_map.find_enumeration("GainAuto")
-                if ag_node:
-                    ag_node.value = "Continuous"
-                    log.info("SDKCameraThread: Set GainAuto = Continuous")
-            except Exception as e:
-                log.warning(f"SDKCameraThread: Could not set GainAuto: {e}")
-
-            # ─── Force Continuous acquisition mode ───────────────────────────────
-            try:
-                acq_node = self.grabber.device_property_map.find_enumeration(
-                    "AcquisitionMode"
-                )
-                if acq_node:
-                    entries = [e.name for e in acq_node.entries]
-                    if "Continuous" in entries:
-                        acq_node.value = "Continuous"
-                        log.info("SDKCameraThread: Set AcquisitionMode = Continuous")
-                    else:
-                        acq_node.value = entries[0]
-                        log.info(f"SDKCameraThread: Set AcquisitionMode = {entries[0]}")
-            except Exception as e:
-                log.warning(f"SDKCameraThread: Could not set AcquisitionMode: {e}")
-
-            # ─── Disable trigger so camera will free‐run ─────────────────────────
-            try:
-                trig_node = self.grabber.device_property_map.find_enumeration(
-                    "TriggerMode"
-                )
-                if trig_node:
-                    trig_node.value = "Off"
-                    log.info("SDKCameraThread: Set TriggerMode = Off")
-                else:
-                    log.warning(
-                        "SDKCameraThread: TriggerMode node not found; assuming free‐run."
-                    )
-            except Exception as e:
-                log.warning(f"SDKCameraThread: Could not disable TriggerMode: {e}")
-
-            # ─── Signal “grabber_ready” so UI can enable controls ────────────────
-            self.grabber_ready.emit()
-
-            # ─── Build QueueSink requesting Mono8 (fallback to native PF if needed)─
-            try:
-                self._sink = ic4.QueueSink(
-                    self, [ic4.PixelFormat.Mono8], max_output_buffers=1
-                )
-            except:
-                native_pf = self._resolution[2] if self._resolution else None
-                if native_pf and hasattr(ic4.PixelFormat, native_pf):
-                    self._sink = ic4.QueueSink(
-                        self,
-                        [getattr(ic4.PixelFormat, native_pf)],
-                        max_output_buffers=1,
-                    )
-                else:
-                    raise RuntimeError(
-                        "SDKCameraThread: Unable to create QueueSink for Mono8 or native PF."
-                    )
-
-            # ─── Start streaming immediately ───────────────────────────────────────
-            from imagingcontrol4 import StreamSetupOption
-
-            self.grabber.stream_setup(
-                self._sink,
-                setup_option=StreamSetupOption.ACQUISITION_START,
-            )
-            log.info(
-                "SDKCameraThread: stream_setup(ACQUISITION_START) succeeded. Entering frame loop…"
-            )
-
-            # ─── Frame loop: IC4 calls frames_queued() whenever a new buffer is ready ─
+            if self._resolution:
+                width, height, pixel_format = self._resolution
+                checked(props.find_enumeration("PixelFormat"), pixel_format, "PixelFormat")
+                checked(props.find_integer("Width"), width, "Width")
+                checked(props.find_integer("Height"), height, "Height")
+            checked(props.find_enumeration("AcquisitionMode"), "Continuous", "AcquisitionMode")
+            self._preview()
+            next_snapshot = time.monotonic() + 0.5
             while not self._stop_requested:
-                self.msleep(10)
-
-            # ─── Stop streaming & close device ───────────────────────────────────
-            self.grabber.stream_stop()
-            self.grabber.device_close()
-            log.info("SDKCameraThread: Streaming stopped, device closed.")
-
-        except Exception as e:
-            msg = str(e)
-            code_enum = getattr(e, "code", None)
-            code_str = str(code_enum) if code_enum else ""
-            log.exception("SDKCameraThread: encountered an error.")
-            self.error.emit(msg, code_str)
-
+                try:
+                    command, value = self._commands.get(timeout=0.02)
+                except queue.Empty:
+                    command = None
+                if command == "record":
+                    self._record(*value)
+                elif command == "preview":
+                    self._preview()
+                elif command == "setting":
+                    try:
+                        self._setting(*value)
+                    except PreviewRecoveryError:
+                        raise
+                    except Exception as exc:
+                        self.control_error.emit(str(exc))
+                    self._snapshot()
+                if time.monotonic() >= next_snapshot:
+                    # Controls are locked during recording; use the verified
+                    # arming snapshot and avoid unnecessary SDK traffic.
+                    if self._profile is None:
+                        self._snapshot()
+                        self._check_preview_timeout()
+                    next_snapshot = time.monotonic() + 0.5
+        except Exception as exc:
+            log.exception("Camera acquisition failed")
+            self.error.emit(str(exc), str(getattr(exc, "code", "")))
         finally:
-            # All cleanup is handled by MainWindow once threads have stopped.
-            pass
+            try:
+                self._stop_stream()
+                if self._profile:
+                    self._profile.restore()
+            except Exception as exc:
+                self.error.emit("Camera cleanup: " + str(exc), "")
+            finally:
+                self._profile = self._sink = None
+                if self.grabber and self.grabber.is_device_open:
+                    try:
+                        self.grabber.device_close()
+                    except Exception as exc:
+                        self.error.emit("Camera close: " + str(exc), "")
+                self.grabber = None
+                self._device_info = None
+                props = None
 
     def frames_queued(self, sink):
-        """
-        This callback is invoked by IC4 each time a new buffer is available.
-        Pop the buffer, convert to QImage, emit it, and allow IC4 to recycle it.
-        """
+        # One notification can represent several queued images.
+        while True:
+            try:
+                buf = sink.try_pop_output_buffer()
+            except Exception as exc:
+                self.error.emit(str(exc), str(getattr(exc, "code", "")))
+                return
+            if buf is None:
+                return
+            self._deliver_buffer(buf)
+
+    def _deliver_buffer(self, buf):
         try:
-            buf = sink.pop_output_buffer()
-            arr = buf.numpy_wrap()  # arr: shape=(H, W) dtype=uint8 or uint16
-
-            # Downconvert 16‐bit to 8‐bit if necessary
-            if arr.dtype == np.uint8:
-                gray8 = arr
+            if not self._deliver:
+                return
+            arr = buf.numpy_wrap()
+            if arr.dtype != np.uint8:
+                raise RuntimeError("Camera sink must deliver 8-bit images")
+            gray = arr[:, :, 0] if arr.ndim == 3 else arr
+            height, width = gray.shape
+            image = QImage(gray.data, width, height, gray.strides[0], QImage.Format_Grayscale8).copy()
+            meta = buf.meta_data
+            metadata = {"run_id": self._run_id,
+                "camera_frame_id": meta.device_frame_number,
+                "camera_timestamp_raw": meta.device_timestamp_ns,
+                "host_monotonic": time.monotonic()}
+            if self._run_id is not None:
+                self.recording_frame_ready.emit(image, metadata)
             else:
-                max_val = float(arr.max()) if arr.max() > 0 else 1.0
-                scale = 255.0 / max_val
-                gray8 = (arr.astype(np.float32) * scale).astype(np.uint8)
+                self._last_preview_frame = metadata["host_monotonic"]
+                if not self._preview_announced:
+                    self._preview_announced = True
+                    self.preview_ready.emit()
+                    if not self._grabber_announced:
+                        self._grabber_announced = True
+                        self.grabber_ready.emit()
+            if metadata["host_monotonic"] - self._last_preview_emit >= 0.05:
+                self.frame_ready.emit(image, metadata)
+                self._last_preview_emit = metadata["host_monotonic"]
+        except Exception as exc:
+            self.error.emit(str(exc), str(getattr(exc, "code", "")))
+        finally:
+            if buf is not None:
+                buf.release()
 
-            h, w = gray8.shape[:2]
-
-            # Build a QImage from single‐channel grayscale
-            qimg = QImage(gray8.data, w, h, gray8.strides[0], QImage.Format_Grayscale8)
-
-            # Emit to the UI
-            self.frame_ready.emit(qimg, buf)
-
-        except Exception as e:
-            log.error(
-                f"SDKCameraThread.frames_queued: Error popping/converting buffer: {e}"
-            )
-            code_enum = getattr(e, "code", None)
-            code_str = str(code_enum) if code_enum else ""
-            self.error.emit(str(e), code_str)
-
-    # ─── Required listener methods for QueueSink ─────────────────────────────
-    def sink_connected(self, sink, pixel_format, min_buffers_required) -> bool:
-        # Return True so the sink actually attaches
+    def sink_connected(self, sink, image_type, min_buffers_required):
+        sink.alloc_and_queue_buffers(max(16, min_buffers_required))
         return True
 
-    def sink_disconnected(self, sink) -> None:
-        # Called when the sink is torn down—no action needed
+    def sink_disconnected(self, sink):
         pass
 
     def stop(self):
-        """
-        Request the streaming loop to end. After this, run() will clean up.
-        """
         self._stop_requested = True

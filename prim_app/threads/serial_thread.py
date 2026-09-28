@@ -1,221 +1,116 @@
-# prim_app/threads/serial_thread.py
-
-import csv
+"""PRIM serial transport. G/S/Z packets remain unchanged; writes are acknowledged."""
+import logging
 import math
+import queue
 import time
 import serial
-import os
-import logging
-from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QWaitCondition
-import queue
+from PyQt5.QtCore import QThread, pyqtSignal
 
 log = logging.getLogger(__name__)
 
-# How many seconds of silence on the serial port we interpret
-# as “Arduino has stopped streaming.” You can tune this if needed.
-IDLE_TIMEOUT_S = 2.0
-
 
 class SerialThread(QThread):
-    data_ready = pyqtSignal(int, float, float)  # (frameIndex, timestamp_s, pressure)
-    error_occurred = pyqtSignal(str)  # For reporting errors back to the GUI
-    status_changed = pyqtSignal(str)  # For general status updates
+    data_ready = pyqtSignal(int, float, float)
+    error_occurred = pyqtSignal(str)
+    status_changed = pyqtSignal(str)
+    command_sent = pyqtSignal(str)
 
     def __init__(self, port=None, baud=115200, test_csv=None, parent=None):
         super().__init__(parent)
-        self.port = port
-        self.baud = baud
+        self.port, self.baud = port, baud
         self.ser = None
-
-        # Control flags
         self.running = False
-        self._got_first_packet = False  # Have we seen at least one valid line?
-        self._last_data_time = None  # Timestamp (time.time()) of last valid packet
         self._stop_requested = False
-        self._idle_timeout_enabled = True  # watchdog for streaming silence
-
-
-        # For sending commands (not used here, but kept for future)
-        self.command_queue = queue.Queue()
-        self.mutex = QMutex()
-        self.wait_condition = QWaitCondition()
-
-    def set_idle_timeout_enabled(self, enabled: bool):
-        """Toggle the idle-timeout watchdog used during streaming."""
-        self._idle_timeout_enabled = bool(enabled)
-        self._got_first_packet = False
+        self._idle_timeout_enabled = False
         self._last_data_time = None
+        self._idle_timeout_s = 3.0
+        self._active_stop_packet = None
+        self.command_queue = queue.Queue()
+
+    def set_idle_timeout_enabled(self, enabled):
+        self._idle_timeout_enabled = bool(enabled)
+        self._last_data_time = time.monotonic() if enabled else None
+
+    def _write(self, packet):
+        count = self.ser.write(packet)
+        if count != len(packet):
+            raise IOError(f"Partial serial write ({count}/{len(packet)} bytes)")
+
+    def _send(self, packet):
+        if packet.startswith(b"<G,"):
+            # Also attempt S if a G write fails partway through.
+            self._active_stop_packet = b"<S," + packet[3:]
+            try:
+                self._idle_timeout_s = max(3.0, 3 * int(packet.split(b",")[1]) / 1000)
+            except ValueError:
+                pass
+        self._write(packet)
+        if packet.startswith((b"<S,", b"<Z,")):
+            self._active_stop_packet = None
+        self.command_sent.emit(packet.decode("ascii").strip())
 
     def run(self):
-        """Main loop for reading from the PRIM device.
-
-        If a serial ``port`` is provided, the thread opens it and emits
-        ``data_ready`` for each valid packet. Lack of new data for
-        ``IDLE_TIMEOUT_S`` seconds after the first packet triggers
-        shutdown.  When no ``port`` is given the thread immediately
-        reports an error and exits.
-        """
-        self.running = True
-        self._got_first_packet = False
-        self._last_data_time = None
-
-        if not self.port:
-            self.error_occurred.emit("No serial port specified")
-            self.running = False
-            return
-
-        # 1) Attempt to open the real serial port
+        pending = bytearray()
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
-            log.info(f"Opened serial port {self.port} @ {self.baud} baud")
+            if not self.port:
+                raise RuntimeError("No serial port selected")
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.05, write_timeout=0.5)
+            self.running = True
             self.status_changed.emit(f"Connected to {self.port}")
-        except Exception as e:
-            log.warning(f"Failed to open serial port {self.port}: {e}")
-            self.error_occurred.emit(f"Error opening serial: {e}")
-            self.ser = None
-
-        # 2) Main loop
-        while self.running and not self._stop_requested:
-            # 2a) Process any outgoing commands
-            try:
-                cmd = self.command_queue.get_nowait()
-                if self.ser and cmd:
-                    self.ser.write(cmd)
-                    log.debug(f"Sent command over serial: {cmd}")
-            except queue.Empty:
-                pass
-            except Exception as e:
-                log.error(f"Error sending serial command: {e}")
-                self.error_occurred.emit(f"Serial send error: {e}")
-
-            # 2b) If we have a real port configured, handle live reading+reconnect
-            if self.port:
-                # 2b-i) If `ser` is None, attempt to reopen once per loop iteration
-                if self.ser is None:
-                    try:
-                        self.ser = serial.Serial(self.port, self.baud, timeout=1)
-                        log.info(f"[SerialThread] Reconnected to {self.port}")
-                        self.status_changed.emit(f"Reconnected to {self.port}")
-                    except Exception as e_op:
-                        # Still cannot open; sleep a bit before retrying
-                        log.debug(
-                            f"[SerialThread] Reopen failed: {e_op} → retrying in 0.1 s"
-                        )
-                        self.msleep(100)
-                    continue
-
-                # 2b-ii) Now `self.ser` is not None → attempt to read lines
+            while not self._stop_requested:
                 try:
-                    if self.ser.in_waiting > 0:
-                        raw = self.ser.readline()
-                        if raw:
-                            line = raw.decode("utf-8", errors="replace").strip()
-                            log.debug(f"Raw serial data: {line}")
-
-                            parts = [fld.strip() for fld in line.split(",")]
-                            if len(parts) < 3:
-                                log.warning(
-                                    f"Malformed data line (expected 3 fields): {line}"
-                                )
-                            else:
-                                try:
-                                    frame_idx_device = int(parts[0])
-                                    t_device = float(parts[1])
-                                    p = float(parts[2])
-                                except ValueError as ve:
-                                    log.error(f"Parse error for line '{line}': {ve}")
-                                else:
-                                    # Valid packet → emit signal
-                                    self.data_ready.emit(frame_idx_device, t_device, p)
-
-                                    # Mark that we've seen at least one packet
-                                    if not self._got_first_packet:
-                                        self._got_first_packet = True
-                                    # Update last-data timestamp
-                                    self._last_data_time = time.time()
-                        else:
-                            # readline timed out without data; will check idle below
-                            pass
-                    else:
-                        # No bytes waiting; sleep briefly
-                        self.msleep(10)
-
-                except serial.SerialException as se:
-                    # Port dropped unexpectedly → attempt to reconnect
-                    log.error(
-                        f"[SerialThread] SerialException: {se} → will attempt reconnect"
-                    )
-                    self.status_changed.emit("Serial disconnected, retrying…")
+                    packet = self.command_queue.get_nowait()
+                except queue.Empty:
+                    packet = None
+                if packet:
+                    self._send(packet)
+                data = self.ser.read(max(1, min(self.ser.in_waiting, 4096)))
+                pending.extend(data)
+                if len(pending) > 65536:
+                    raise RuntimeError("PRIM serial input exceeded the line-buffer limit")
+                while b"\n" in pending:
+                    line, _, remainder = pending.partition(b"\n")
+                    pending = bytearray(remainder)
+                    if not line.strip():
+                        continue
                     try:
-                        self.ser.close()
-                    except Exception:
-                        pass
-                    self.ser = None
-                    # Wait a short moment before retrying
-                    t0 = time.time()
-                    while (
-                        self.running
-                        and not self._stop_requested
-                        and (time.time() - t0) < 1.0
-                    ):
-                        # Sleep in small increments so we remain responsive
-                        self.msleep(50)
-                    continue
-
-                except Exception as e:
-                    log.exception(f"[SerialThread] Unexpected error in read loop: {e}")
-                    self.msleep(100)
-
-                # ---- Idle timeout watchdog ---------------------------------
-                if (
-                    self._idle_timeout_enabled
-                    and self._got_first_packet
-                    and self._last_data_time is not None
-                    and (time.time() - self._last_data_time) > IDLE_TIMEOUT_S
-                ):
-                    msg = (
-                        f"No data from Arduino for {time.time() - self._last_data_time:.1f}s"
-                    )
-                    log.error(f"[SerialThread] {msg}")
-                    self.error_occurred.emit(msg)
-                    self._stop_requested = True
-
-
-        # 3) Clean up on exit
-        if self.ser:
-            try:
-                self.ser.close()
-                log.info(f"Closed serial port {self.port}")
-            except Exception as e:
-                log.exception(f"Error closing serial port {self.port}: {e}")
-
-        self.status_changed.emit("Disconnected")
-        self.running = False
-        log.info("SerialThread finished.")
+                        fields = line.decode("ascii").strip().split(",")
+                        if len(fields) != 3:
+                            raise ValueError("expected three fields")
+                        counter, device_time, pressure = int(fields[0]), float(fields[1]), float(fields[2])
+                        if not all(math.isfinite(v) for v in (device_time, pressure)):
+                            raise ValueError("non-finite values")
+                    except (ValueError, UnicodeError) as exc:
+                        raise RuntimeError(f"Invalid PRIM data {bytes(line)!r}: {exc}") from exc
+                    self._last_data_time = time.monotonic()
+                    self.data_ready.emit(counter, device_time, pressure)
+                if (self._idle_timeout_enabled and self._last_data_time is not None
+                        and time.monotonic() - self._last_data_time > self._idle_timeout_s):
+                    raise RuntimeError("PRIM stopped sending data during acquisition")
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+        finally:
+            # Never replay a queued G after a disconnect. Best-effort S applies
+            # only to acquisition this transport started, not manual PRIM runs.
+            if self.ser is not None:
+                if self._active_stop_packet:
+                    try:
+                        self._write(self._active_stop_packet)
+                    except Exception as exc:
+                        self.error_occurred.emit("PRIM stop could not be confirmed: " + str(exc))
+                try:
+                    self.ser.close()
+                except Exception as exc:
+                    self.error_occurred.emit("Serial close failed: " + str(exc))
+            self.ser = None
+            self.running = False
+            self.status_changed.emit("Disconnected")
 
     def send_command(self, command_str):
-        """
-        Queue a command (ASCII + newline) for the Arduino. GUI can call this safely.
-        """
-        if self.running:
-            final_command = command_str.encode("utf-8") + b"\n"
-            self.command_queue.put(final_command)
-            log.info(f"Queued command: {command_str}")
-        else:
-            log.warning("Serial thread not running → cannot send command.")
-            self.error_occurred.emit("Cannot send: Serial disconnected.")
+        if not self.running or self._stop_requested:
+            return False
+        self.command_queue.put(command_str.encode("ascii") + b"\n")
+        return True
 
     def stop(self):
-        """
-        Ask the thread to exit cleanly. If it doesn't within 2 seconds, force‐terminate.
-        """
-        log.info("Stopping SerialThread…")
         self._stop_requested = True
-        self.running = False
-        self.wait_condition.wakeAll()
-        self.quit()
-        self.wait(2000)
-        if self.isRunning():
-            log.warning("SerialThread did not stop gracefully → terminating.")
-            self.terminate()
-            self.wait(1000)

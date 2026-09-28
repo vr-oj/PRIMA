@@ -1,5 +1,5 @@
 #define AppName "PRIMA"
-#define AppVersion "3.0.0"
+#define AppVersion "3.5.0"
 #define AppPublisher "Tykocki Lab"
 #define AppExeName "PRIMA.exe"
 
