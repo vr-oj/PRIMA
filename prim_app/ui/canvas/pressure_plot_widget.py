@@ -47,7 +47,7 @@ class PressurePlotWidget(QWidget):
         self.fig = Figure(facecolor="white", tight_layout=True)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor("white")
-        self.ax.set_xlabel("Time (s)", fontsize=16, fontweight="bold")
+        self.ax.set_xlabel("Time from recording start (s)", fontsize=16, fontweight="bold")
         self.ax.set_ylabel("Pressure (mmHg)", fontsize=16, fontweight="bold")
         self.ax.tick_params(labelsize=10)
         for spine in self.ax.spines.values():
@@ -248,7 +248,9 @@ class PressurePlotWidget(QWidget):
         self.times.append(t)
         self.pressures.append(p)
         self.line.set_data(self.times, self.pressures)
+        self._update_axes(auto_x, auto_y)
 
+    def _update_axes(self, auto_x, auto_y):
         # Remember the current axis limits so we only redraw if something changes:
         current_xlim = self.ax.get_xlim()
         current_ylim = self.ax.get_ylim()
@@ -261,15 +263,15 @@ class PressurePlotWidget(QWidget):
             if len(self.times) > 1:
                 start, end = self.times[0], self.times[-1]
                 pad = max(1, (end - start) * 0.05)
-                self.ax.set_xlim(start - pad * 0.1, end + pad * 0.9)
+                self.ax.set_xlim(max(0, start - pad * 0.1), end + pad * 0.9)
             elif self.times:  # single data point
                 t0 = self.times[-1]
-                self.ax.set_xlim(t0 - 0.5, t0 + 0.5)
+                self.ax.set_xlim(max(0, t0 - 0.5), t0 + 0.5)
         else:
             # SLIDING WINDOW: always show [t_latest - window_duration, t_latest]
             t_latest = self.times[-1]
             xmin = max(0.0, t_latest - self.window_duration)
-            xmax = t_latest
+            xmax = max(t_latest, xmin + 0.5)
             self.manual_xlim = (xmin, xmax)
             self.ax.set_xlim(self.manual_xlim)
 
@@ -409,9 +411,8 @@ class PressurePlotWidget(QWidget):
 
         # Re-evaluate plot based on current data and new auto settings
         if self.times:
-            # Call update_plot with the last data point to trigger re-scaling
-            # The auto_x and auto_y flags will ensure correct scaling behavior
-            self.update_plot(self.times[-1], self.pressures[-1], auto_x, auto_y)
+            # Recompute the view without appending a duplicate sample.
+            self._update_axes(auto_x, auto_y)
         else:  # No data, set to default view
             self.ax.set_xlim(0, 10)  # Default X if no data
             if self.manual_ylim and not auto_y:  # Apply manual Y if set and not auto_y
@@ -426,6 +427,9 @@ class PressurePlotWidget(QWidget):
     def clear_plot(self):
         self.times.clear()
         self.pressures.clear()
+        self.manual_xlim = None
+        self.scrollbar.hide()
+        self.scrollbar.setRange(0, 0)
 
         self.line.set_data([], [])
         self.ax.set_xlim(0, 100)  # Reset to a default X view

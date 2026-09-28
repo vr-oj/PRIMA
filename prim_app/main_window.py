@@ -7,8 +7,9 @@ import logging
 import csv
 import json
 from datetime import datetime
-import imagingcontrol4 as ic4
 import subprocess
+import time
+import uuid
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -35,6 +36,8 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QHBoxLayout,
+    QFrame,
+    QSplitter,
 )
 from PyQt5.QtCore import (
     Qt,
@@ -44,6 +47,8 @@ from PyQt5.QtCore import (
     QSize,
     QThread,
     QMetaObject,
+    pyqtSignal,
+    Q_ARG,
 )
 from PyQt5.QtGui import QIcon, QKeySequence, QImage, QDesktopServices
 from PyQt5.QtCore import QUrl
@@ -83,15 +88,21 @@ from ui.control_panels.plot_control_panel import PlotControlPanel
 from ui.canvas.pressure_plot_widget import PressurePlotWidget
 
 from threads.serial_thread import SerialThread
-from threads.sdk_camera_thread import SDKCameraThread
+from cameras.registry import CameraRegistry
 from recording_manager import RecordingManager
 from utils.utils import list_serial_ports
 from playback_window import PlaybackWindow
+from ui.style_constants import PANEL_STYLESHEET
+from ui.control_panels.camera_info_panel import CameraInfoPanel
+from ui.recording_completion_dialog import RecordingCompletionDialog
 
 log = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
+    activate_recorder = pyqtSignal(object)
+    recording_issue = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
 
@@ -101,9 +112,23 @@ class MainWindow(QMainWindow):
         self._recorder_thread = None
         self._recorder_worker = None
         self._current_fill_folder = None
-        self._open_folder_prompt = load_app_setting(SETTING_OPEN_FOLDER_PROMPT, True)
         self._last_recording_paths = {"tiff": None, "csv": None}
         self._active_recording_settings = None
+        self._recording_state = "idle"
+        self._camera_ready = False
+        self._camera_armed = False
+        self._preview_restoring = False
+        self._start_sent = False
+        self._zero_before_start_pending = False
+        self._stop_sent = False
+        self._run_id = None
+        self._serial_counter = None
+        self._last_serial_activity = None
+        self._completion_summary = None
+        self._completion_dialog = None
+        self._closing = False
+        self.camera_registry = CameraRegistry()
+        self.camera_registry.set_micro_manager_profiles(load_app_setting("micro_manager_profiles", []))
 
         # Camera‐related
         self.device_combo = None
@@ -128,18 +153,6 @@ class MainWindow(QMainWindow):
         self.lbl_cam_connection = None
         self.lbl_cam_frame = None
         self.lbl_cam_resolution = None
-
-        # ─── CREATE THE RECORDER THREAD + WORKER ─────────────────────────────────
-        # 1) Instantiate the thread object:
-        self._recorder_thread = QThread(self)
-        dummy_output_dir = ""  # replace with a default or override later
-        self._recorder_worker = RecordingManager(dummy_output_dir)
-        # 2) Move the worker into the new thread:
-        self._recorder_worker.moveToThread(self._recorder_thread)
-        # 3) Connect the worker’s finished signal → thread.quit() and cleanup:
-        self._recorder_worker.finished.connect(self._recorder_thread.quit)
-        self._recorder_worker.finished.connect(self._recorder_worker.deleteLater)
-        self._recorder_thread.finished.connect(self._recorder_thread.deleteLater)
 
         self._init_paths_and_icons()
         self._build_console_log_dock()
@@ -206,164 +219,110 @@ class MainWindow(QMainWindow):
         self.dock_console.setVisible(False)
 
     def _build_central_widget_layout(self):
-        """
-        Top row: control ribbon with Camera | PRIM Device | Plot Controls.
-        Bottom row: [QtCameraWidget (live)] | [PressurePlotWidget (live plot)]
-        """
-        self.camera_widget = QtCameraWidget(self)
-
         central = QWidget()
-        main_vlay = QVBoxLayout(central)
-        main_vlay.setContentsMargins(4, 4, 4, 4)
-        main_vlay.setSpacing(6)
-
-        # ─── Top Row (Control Ribbon) ─────────────────────────────────────
-        top_row_widget = QWidget()
-        top_row_lay = QHBoxLayout(top_row_widget)
-        top_row_lay.setContentsMargins(0, 0, 0, 0)
-        top_row_lay.setSpacing(10)
-
-        # Camera Control Tabs (Camera & Controls)
-        self.camera_tabs = QTabWidget()
-        self.camera_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-
-        # Camera Info Tab
-        info_tab = QWidget()
-        info_layout = QFormLayout(info_tab)
-        info_layout.setContentsMargins(6, 6, 6, 6)
-        info_layout.setSpacing(4)
-
-        self.lbl_cam_connection = QLabel("Disconnected")
-        info_layout.addRow("Camera Status:", self.lbl_cam_connection)
-
-        self.lbl_cam_frame = QLabel("0")
-        info_layout.addRow("Frame #:", self.lbl_cam_frame)
-
-        self.lbl_cam_resolution = QLabel("N/A")
-        info_layout.addRow("Resolution:", self.lbl_cam_resolution)
-
-        self.device_combo = QComboBox()
-        self.device_combo.addItem("Select Device...", None)
-        self.device_combo.currentIndexChanged.connect(self._on_device_selected)
-        info_layout.addRow("Device:", self.device_combo)
-
-        self.resolution_combo = QComboBox()
-        self.resolution_combo.addItem("Select Resolution…", None)
-        info_layout.addRow("Resolution:", self.resolution_combo)
-
-        self.btn_start_camera = QPushButton("Start Camera")
-        self.btn_start_camera.clicked.connect(self._on_start_stop_camera)
-        info_layout.addRow("", self.btn_start_camera)
-
-        self.camera_tabs.addTab(info_tab, "Camera")
-
-        # Controls Tab
-        controls_tab = QWidget()
-        controls_layout = QVBoxLayout(controls_tab)
-        controls_layout.setContentsMargins(6, 6, 6, 6)
-        controls_layout.setSpacing(6)
-
-        # Instantiate CameraControlPanel here (disabled by default)
-        self.camera_control_panel = CameraControlPanel(parent=self)
-        self.camera_control_panel.disable_camera_controls()
-        controls_layout.addWidget(self.camera_control_panel)
-
-        self.camera_tabs.addTab(controls_tab, "Controls")
-
-        cam_group = QGroupBox("Camera")
-        cam_layout = QVBoxLayout(cam_group)
-        cam_layout.setContentsMargins(3, 3, 3, 3)
-        cam_layout.setSpacing(4)
-        cam_layout.addWidget(self.camera_tabs)
-        top_row_lay.addWidget(cam_group, stretch=2)
-
-        # PRIM Device panel
+        root = QVBoxLayout(central)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(6)
         self.top_ctrl = TopControlPanel(self)
         self.top_ctrl.zero_requested.connect(self._on_zero_prim)
-        top_row_lay.addWidget(self.top_ctrl, stretch=2)
+        self.top_ctrl.record_requested.connect(self._toggle_recording)
+        root.addWidget(self.top_ctrl, 0)
 
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("Choose camera…", None)
+        self.device_combo.currentIndexChanged.connect(self._on_device_selected)
+        self.device_combo.activated.connect(self._on_camera_choice_activated)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItem("Choose resolution…", None)
+        for combo in (self.device_combo, self.resolution_combo):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(16)
+            combo.view().setStyleSheet(
+                "QAbstractItemView { background: #454545; color: #ffffff; "
+                "selection-background-color: #3DBD7D; selection-color: #0B1014; }")
+            combo.currentTextChanged.connect(combo.setToolTip)
+        self.btn_start_camera = QPushButton("Start Camera")
+        self.btn_start_camera.setProperty("cssClass", "primary")
+        self.btn_start_camera.clicked.connect(self._on_start_stop_camera)
 
-        # Plot controls panel
-        self.plot_control_panel = PlotControlPanel(self)
-        top_row_lay.addWidget(self.plot_control_panel, stretch=2)
-
-        main_vlay.addWidget(top_row_widget, stretch=0)
-
-        # ─── Bottom Row ───────────────────────────────────────────────────
-        bottom_row_widget = QWidget()
-        bottom_row_layout = QHBoxLayout(bottom_row_widget)
-        bottom_row_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_row_layout.setSpacing(6)
-
-        # Left: live viewfinder
+        self.workspace_splitter = QSplitter(Qt.Horizontal, central)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setHandleWidth(6)
+        camera_workspace = QWidget()
+        camera_workspace.setObjectName("CameraWorkspace")
+        camera_layout = QVBoxLayout(camera_workspace)
+        camera_layout.setContentsMargins(0, 0, 0, 0)
+        camera_layout.setSpacing(6)
+        self.camera_control_panel = CameraControlPanel(self)
+        self.camera_control_panel.setting_requested.connect(self._set_camera_setting)
+        self.camera_control_panel.acquisition_changed.connect(self._refresh_recording_button_states)
+        self.camera_info_panel = CameraInfoPanel(self.camera_control_panel, self)
+        self.lbl_cam_connection = self.camera_info_panel.status_badge
+        self.lbl_cam_frame = self.camera_info_panel.frame_label
+        self.lbl_cam_resolution = self.camera_info_panel.resolution_label
+        self.camera_widget = QtCameraWidget(self)
         self.camera_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        bottom_row_layout.addWidget(self.camera_widget, stretch=1)
+        camera_layout.addWidget(self.camera_info_panel, 0)
+        camera_layout.addWidget(self.camera_widget, 1)
 
-        # Right: live plot
+        plot_workspace = QWidget()
+        plot_workspace.setObjectName("PlotWorkspace")
+        plot_layout = QVBoxLayout(plot_workspace)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(6)
+        self.plot_control_panel = PlotControlPanel(self)
         self.pressure_plot_widget = PressurePlotWidget(self)
-        self.pressure_plot_widget.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Expanding
-        )
-        bottom_row_layout.addWidget(self.pressure_plot_widget, stretch=1)
-
-        main_vlay.addWidget(bottom_row_widget, stretch=1)
-
-        # ─── Wire Up PlotControlPanel → PressurePlotWidget ────────────────
-        if hasattr(self.pressure_plot_widget, "set_auto_scale_x"):
-            self.plot_control_panel.autoscale_x_changed.connect(
-                self.pressure_plot_widget.set_auto_scale_x
-            )
-        if hasattr(self.pressure_plot_widget, "set_auto_scale_y"):
-            self.plot_control_panel.autoscale_y_changed.connect(
-                self.pressure_plot_widget.set_auto_scale_y
-            )
-        if hasattr(self.pressure_plot_widget, "set_manual_x_limits"):
-            self.plot_control_panel.x_axis_limits_changed.connect(
-                self.pressure_plot_widget.set_manual_x_limits
-            )
-        if hasattr(self.pressure_plot_widget, "set_manual_y_limits"):
-            self.plot_control_panel.y_axis_limits_changed.connect(
-                self.pressure_plot_widget.set_manual_y_limits
-            )
-        if hasattr(self.pressure_plot_widget, "reset_zoom"):
-            self.plot_control_panel.reset_zoom_requested.connect(
-                lambda: self.pressure_plot_widget.reset_zoom(
-                    self.plot_control_panel.is_autoscale_x(),
-                    self.plot_control_panel.is_autoscale_y(),
-                )
-            )
-        if hasattr(self.pressure_plot_widget, "export_as_image"):
-            self.plot_control_panel.export_plot_image_requested.connect(
-                self.pressure_plot_widget.export_as_image
-            )
-        if hasattr(self.pressure_plot_widget, "clear_plot"):
-            self.plot_control_panel.clear_plot_requested.connect(
-                self.pressure_plot_widget.clear_plot
-            )
-
+        self.pressure_plot_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        plot_layout.addWidget(self.plot_control_panel, 0)
+        plot_layout.addWidget(self.pressure_plot_widget, 1)
+        self.workspace_splitter.addWidget(camera_workspace)
+        self.workspace_splitter.addWidget(plot_workspace)
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes([1000, 1000])
+        root.addWidget(self.workspace_splitter, 1)
+        for signal, method in (("autoscale_x_changed", "set_auto_scale_x"),
+                ("autoscale_y_changed", "set_auto_scale_y"), ("x_axis_limits_changed", "set_manual_x_limits"),
+                ("y_axis_limits_changed", "set_manual_y_limits"), ("export_plot_image_requested", "export_as_image"),
+                ("clear_plot_requested", "clear_plot")):
+            if hasattr(self.pressure_plot_widget, method):
+                getattr(self.plot_control_panel, signal).connect(getattr(self.pressure_plot_widget, method))
+        self.plot_control_panel.reset_zoom_requested.connect(lambda: self.pressure_plot_widget.reset_zoom(
+            self.plot_control_panel.is_autoscale_x(), self.plot_control_panel.is_autoscale_y()))
         self.setCentralWidget(central)
+        QTimer.singleShot(0, self._equalize_workspace_panels)
+        QTimer.singleShot(250, self._equalize_workspace_panels)
+
+    def _equalize_workspace_panels(self):
+        """Match BURST's control-card heights so the live panes align."""
+        height = max(self.camera_info_panel.sizeHint().height(),
+                     self.plot_control_panel.sizeHint().height())
+        self.camera_info_panel.setFixedHeight(height)
+        self.plot_control_panel.setFixedHeight(height)
+
+    @staticmethod
+    def _fit_combo_popup(combo):
+        """Use BURST's compact fields with popup widths fitted to full names."""
+        if combo.count():
+            width = max(combo.fontMetrics().horizontalAdvance(combo.itemText(i))
+                        for i in range(combo.count()))
+            combo.view().setMinimumWidth(max(combo.minimumWidth(), min(width + 52, 620)))
 
     # ─── Camera Device & Resolution Enumeration ─────────────────────────────
     def _populate_device_list(self):
-        try:
-            device_list = ic4.DeviceEnum.devices()
-        except Exception as e:
-            log.error(f"Failed to enumerate IC4 devices: {e}")
-            device_list = []
-
-        if not device_list:
-            log.info("DEBUG: DeviceEnum.devices() returned ZERO devices.")
-        else:
-            for idx, dev in enumerate(device_list):
-                log.info(
-                    f"DEBUG: Device {idx} = {dev.model_name!r} (S/N {dev.serial!r})"
-                )
-
+        previous = self.device_combo.currentData()
+        device_list = self.camera_registry.discover_cameras()
+        self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        self.device_combo.addItem("Select Device...", None)
+        self.device_combo.addItem("Choose camera…", None)
         for dev in device_list:
-            display_str = f"{dev.model_name}  (S/N: {dev.serial})"
-            self.device_combo.addItem(display_str, dev)
+            self.device_combo.addItem(dev.display_name, dev)
+            if getattr(previous, "backend", None) == dev.backend and getattr(previous, "id", None) == dev.id:
+                self.device_combo.setCurrentIndex(self.device_combo.count() - 1)
+        self.device_combo.addItem("Micro-Manager Camera Setup…", "micromanager_setup")
+        self.device_combo.blockSignals(False)
+        self._on_device_selected(self.device_combo.currentIndex())
+        self._fit_combo_popup(self.device_combo)
 
     def _refresh_serial_port_list(self):
         ports = list_serial_ports()
@@ -385,183 +344,144 @@ class MainWindow(QMainWindow):
         self._refresh_serial_port_list()
         self.statusBar().showMessage("Device lists refreshed", 3000)
 
-    @pyqtSlot(int)
     def _on_device_selected(self, index):
-        """
-        Called whenever the user picks a different camera in the “Device” combo.
-        Open it briefly, enumerate PixelFormat × (W,H), then close.
-        """
-        dev_info = self.device_combo.itemData(index)
+        if self.camera_thread is not None:
+            return
+        info = self.device_combo.itemData(index)
         self.resolution_combo.clear()
-        self.resolution_combo.addItem("Select Resolution…", None)
-
-        if not dev_info:
+        self.resolution_combo.addItem("Choose resolution…", None)
+        if not info or info == "micromanager_setup":
             return
-
-        grab = ic4.Grabber()
         try:
-            grab.device_open(dev_info)
+            for mode in self.camera_registry.list_modes(info):
+                self.resolution_combo.addItem(mode.display_name, mode.as_tuple())
+            if self.resolution_combo.count() > 1:
+                self.resolution_combo.setCurrentIndex(1)
+            self._fit_combo_popup(self.resolution_combo)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Camera information: {exc}", 8000)
 
-            # Force Continuous acquisition if possible
-            acq_node = grab.device_property_map.find_enumeration("AcquisitionMode")
-            if acq_node:
-                names = [e.name for e in acq_node.entries]
-                if "Continuous" in names:
-                    acq_node.value = "Continuous"
-                else:
-                    acq_node.value = names[0]
+    def _on_camera_choice_activated(self, index):
+        if self.device_combo.itemData(index) == "micromanager_setup":
+            self._setup_micro_manager()
 
-            pf_node = grab.device_property_map.find_enumeration("PixelFormat")
-            if pf_node:
-                for entry in pf_node.entries:
-                    pf_name = entry.name
-                    try:
-                        pf_node.value = pf_name
-                        w_prop = grab.device_property_map.find_integer("Width")
-                        h_prop = grab.device_property_map.find_integer("Height")
-                        if w_prop and h_prop:
-                            w = w_prop.value
-                            h = h_prop.value
-                            display_str = f"{w}×{h} ({pf_name})"
-                            self.resolution_combo.addItem(display_str, (w, h, pf_name))
-                    except Exception:
-                        # skip any PF that fails
-                        pass
+    def _setup_micro_manager(self):
+        if self._recording_state != "idle" or self.camera_thread is not None:
+            return
+        from ui.micro_manager_setup import MicroManagerSetupDialog
+        backend = self.camera_registry.backends.get("micromanager")
+        dialog = MicroManagerSetupDialog(backend.sdk if backend else None,
+            load_app_setting("micro_manager_profiles", []), self,
+            self.camera_registry.unavailable.get("micromanager", ""))
+        if dialog.exec_() == QDialog.Accepted:
+            save_app_setting("micro_manager_profiles", dialog.profiles)
+            self.camera_registry.set_micro_manager_profiles(dialog.profiles)
+        self._populate_device_list()
 
-        except Exception as e:
-            log.error(f"Failed to get formats for {dev_info}: {e}")
-        finally:
-            try:
-                grab.device_close()
-            except Exception:
-                pass
-
-    @pyqtSlot()
     def _on_start_stop_camera(self):
-        """
-        Called when the user clicks “Start Camera” or “Stop Camera”.
-        """
-        if self.camera_thread is None or not self.camera_thread.isRunning():
-            # ─── Start camera ─────────────────────────────────────────────────
-            dev_info = self.device_combo.currentData()
-            if dev_info is None:
-                QMessageBox.warning(self, "Camera", "Please select a device first.")
-                return
-
-            resdata = self.resolution_combo.currentData()
-            if not resdata:
-                QMessageBox.warning(self, "Camera", "Please select a resolution first.")
-                return
-
-            w, h, pf_name = resdata
-
-            # Instantiate the SDK camera thread
-            self.camera_thread = SDKCameraThread(parent=self)
-            self.camera_thread.set_device_info(dev_info)
-            self.camera_thread.set_resolution((w, h, pf_name))
-
-            # 1) When the grabber is open & streaming, enable the sliders, etc.
-            self.camera_thread.grabber_ready.connect(self._on_grabber_ready)
-
-            # 2) Each time a new frame is ready, update the QtCameraWidget
-            self.camera_thread.frame_ready.connect(self.camera_widget._on_frame_ready)
-
-            # 3) On any camera error, pop up a dialog and tear everything down
-            self.camera_thread.error.connect(self._on_camera_error)
-
-            # Show “Connecting…” in the Camera tab
-            self.lbl_cam_connection.setText("Connecting…")
-            self.lbl_cam_frame.setText("0")
-            self.lbl_cam_resolution.setText("N/A")
-
-            # Actually start the thread
-            self.camera_thread.start()
-            self.btn_start_camera.setText("Stop Camera")
-            self.camera_control_panel.disable_camera_controls()
-
-        else:
-            # ─── Stop camera ──────────────────────────────────────────────────
+        if self._recording_state != "idle":
+            return
+        if self.camera_thread is not None:
             self.camera_thread.stop()
-            self.camera_thread = None
+            self.btn_start_camera.setEnabled(False)
+            return
+        info, resolution = self.device_combo.currentData(), self.resolution_combo.currentData()
+        if info is None or info == "micromanager_setup" or resolution is None:
+            QMessageBox.warning(self, "Camera", "Select a camera and format first.")
+            return
+        camera = self.camera_registry.get_thread(info, self)
+        self.camera_thread = camera
+        camera.set_resolution(resolution)
+        camera.grabber_ready.connect(self._on_grabber_ready)
+        camera.frame_ready.connect(self.camera_widget._on_frame_ready)
+        camera.frame_ready.connect(self._update_camera_info)
+        camera.settings_ready.connect(self.camera_control_panel.apply_settings)
+        camera.control_error.connect(self.camera_control_panel.show_control_error)
+        camera.timing_ready.connect(self._on_camera_armed)
+        camera.timing_failed.connect(self._on_camera_arm_failed)
+        camera.preview_ready.connect(self._on_preview_ready)
+        camera.error.connect(self._on_camera_error)
+        camera.finished.connect(self._on_camera_finished)
+        self.camera_info_panel.update_status("Connecting…")
+        self.camera_control_panel.disable_camera_controls()
+        self.device_combo.setEnabled(False)
+        self.resolution_combo.setEnabled(False)
+        self.btn_start_camera.setText("Stop Camera")
+        camera.start()
 
-            # Reset UI
-            self.btn_start_camera.setText("Start Camera")
-            self.camera_control_panel.disable_camera_controls()
-            try:
-                self.camera_control_panel.stop_auto_update()
-                self.camera_control_panel.grabber = None
-            except Exception:
-                pass
-            self.lbl_cam_connection.setText("Disconnected")
-            self.lbl_cam_frame.setText("0")
-            self.lbl_cam_resolution.setText("N/A")
-            self.camera_widget.clear_image()
-
-    @pyqtSlot()
     def _on_grabber_ready(self):
-        """
-        Called once SDKCameraThread has opened the grabber and started streaming.
-        We now hand the grabber over to CameraControlPanel to build its controls.
-        """
-        if self.camera_thread is None:
+        self._camera_ready = True
+        self.camera_info_panel.update_status("Preview · free-running")
+        self._refresh_recording_button_states()
+
+    def _set_camera_setting(self, name, value):
+        if self.camera_thread and self._recording_state == "idle":
+            self.camera_control_panel.show_control_error("")
+            if name in ("AcquisitionFrameRate", "PixelFormat"):
+                self._camera_ready = False
+                self.camera_info_panel.update_status("Updating preview…")
+                self._refresh_recording_button_states()
+            self.camera_thread.request_setting(name, value)
+
+    def _on_camera_finished(self):
+        camera = self.camera_thread
+        self.camera_thread = None
+        self._camera_ready = self._camera_armed = self._preview_restoring = False
+        self.camera_control_panel.disable_camera_controls()
+        self.camera_info_panel.update_status("Disconnected")
+        self.btn_start_camera.setText("Start Camera")
+        self.btn_start_camera.setEnabled(True)
+        self.device_combo.setEnabled(True)
+        self.resolution_combo.setEnabled(True)
+        self.camera_widget.clear_image()
+        if camera:
+            camera.deleteLater()
+        self._finish_recording_ui()
+        self._refresh_recording_button_states()
+
+    def _on_preview_ready(self):
+        self._camera_ready = True
+        self._camera_armed = False
+        self._preview_restoring = False
+        self.camera_info_panel.update_status("Preview · free-running")
+        self.camera_info_panel.set_recording_details("Preview is free-running; recording follows Arduino trigger pulses.")
+        self._finish_recording_ui()
+        self._refresh_recording_button_states()
+
+    def _on_camera_armed(self, run_id, details):
+        if run_id != self._run_id or self._recording_state != "preparing":
             return
+        self._camera_armed = True
+        self.camera_info_panel.update_status("Armed · " + details["trigger_source"])
+        rate = details.get("camera_operating_fps")
+        rate_text = f"{rate:g} fps" if rate is not None else "rate not reported"
+        self.camera_info_panel.set_recording_details(
+            f"Arduino triggered · camera {rate_text} · "
+            f"exposure {details['exposure_us'] / 1000:g} ms held during recording")
+        self._start_acquisition(details)
 
-        grabber = self.camera_thread.grabber
-        if not grabber or not grabber.is_device_open:
-            log.error("MainWindow: grabber_ready() arrived, but grabber is not open.")
-            return
-
-        self.camera_control_panel.grabber = grabber
-        self.camera_control_panel._on_grabber_ready()
-        self.camera_control_panel.setEnabled(True)
-
-        self.lbl_cam_connection.setText("Connected")
+    def _on_camera_arm_failed(self, run_id, message):
+        if run_id == self._run_id:
+            self._handle_recorder_error(message)
 
     @pyqtSlot(QImage, object)
     def _update_camera_info(self, image: QImage, raw):
-        """
-        (Optional) Keep updating frame count & resolution in the “Camera” tab
-        every time a new frame arrives.  If you want to hook this up, simply:
-            self.camera_thread.frame_ready.connect(self._update_camera_info)
-        """
-        try:
-            current_count = int(self.lbl_cam_frame.text())
-        except ValueError:
-            current_count = 0
-        current_count += 1
-        self.lbl_cam_frame.setText(str(current_count))
+        """Display the actual camera ID; preview delivery is throttled."""
+        self.camera_info_panel.update_frame(raw.get("camera_frame_id") if raw.get("camera_frame_id") is not None else "—", image.width(), image.height())
+        device = self.device_combo.currentData()
+        if getattr(device, "backend", None) == "micromanager":
+            index = self.resolution_combo.currentIndex()
+            self.resolution_combo.setItemText(index, f"{image.width()} × {image.height()} (Configuration)")
 
-        width = image.width()
-        height = image.height()
-        self.lbl_cam_resolution.setText(f"{width}×{height}")
 
-        if self.lbl_cam_connection.text() != "Connected":
-            self.lbl_cam_connection.setText("Connected")
-
-    @pyqtSlot(str, str)
-    def _on_camera_error(self, msg: str, code: str):
-        """
-        Show any camera‐related IC4 errors in a dialog, then reset UI to “off” state.
-        """
-        log.error(f"Camera error occurred ({code}): {msg}")
-        hint = "Please check the camera connection or restart the device."
-        self._show_error_dialog(
-            "Camera Error", f"{msg}\n\n{hint}", details=f"Code: {code}"
-        )
-
-        # If the thread is still running, stop it
-        if self.camera_thread and self.camera_thread.isRunning():
-            try:
-                self.camera_thread.stop()
-            except Exception:
-                pass
-
-        self.camera_control_panel.disable_camera_controls()
-        self.lbl_cam_connection.setText("Error")
-        self.lbl_cam_frame.setText("0")
-        self.lbl_cam_resolution.setText("N/A")
-        self.camera_widget.clear_image()
-        self.btn_start_camera.setText("Start Camera")
+    def _on_camera_error(self, message, code):
+        self._camera_ready = False
+        self.statusBar().showMessage("Camera: " + message, 10000)
+        self.camera_control_panel.show_control_error(message)
+        if self._recording_state != "idle":
+            self._handle_recorder_error("Camera: " + message)
+        if self.camera_thread:
+            self.camera_thread.stop()
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -645,6 +565,7 @@ class MainWindow(QMainWindow):
         tb.setObjectName("MainControlsToolbar")
         tb.setIconSize(QSize(20, 20))
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        tb.setStyleSheet(PANEL_STYLESHEET)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
         # Refresh device lists
@@ -659,7 +580,7 @@ class MainWindow(QMainWindow):
         # Serial port connect/disconnect
         self.connect_serial_action = QAction(
             self.icon_connect,
-            "&Connect PRIM Device",
+            "&Connect PRIM Arduino Box",
             self,
             triggered=self._toggle_serial_connection,
         )
@@ -672,10 +593,32 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.serial_port_combobox)
         tb.addSeparator()
 
-        if hasattr(self, "start_recording_action"):
-            tb.addAction(self.start_recording_action)
-        if hasattr(self, "stop_recording_action"):
-            tb.addAction(self.stop_recording_action)
+        camera_group = QWidget(self)
+        camera_group_layout = QHBoxLayout(camera_group)
+        camera_group_layout.setContentsMargins(6, 0, 4, 0)
+        camera_group_layout.setSpacing(6)
+
+        camera_label = QLabel("Camera Device")
+        camera_label.setProperty("cssClass", "panelTitle")
+        camera_group_layout.addWidget(camera_label)
+        self.device_combo.setMinimumWidth(250)
+        self.device_combo.setMaximumWidth(370)
+        self.device_combo.setToolTip("Select the camera by model and serial number.")
+        camera_group_layout.addWidget(self.device_combo)
+
+        resolution_label = QLabel("Resolution")
+        resolution_label.setProperty("cssClass", "detailLabel")
+        camera_group_layout.addWidget(resolution_label)
+        self.resolution_combo.setMinimumWidth(205)
+        self.resolution_combo.setMaximumWidth(270)
+        self.resolution_combo.setToolTip("Select the camera resolution")
+        camera_group_layout.addWidget(self.resolution_combo)
+        self.btn_start_camera.setMinimumWidth(112)
+        self.btn_start_camera.setMinimumHeight(30)
+        camera_group_layout.addWidget(self.btn_start_camera)
+        tb.addWidget(camera_group)
+        tb.addSeparator()
+
         self.playback_action = QAction(
             self.icon_playback,
             "Playback Last Recording",
@@ -722,6 +665,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_zero_prim(self):
         """Send the zeroing command to the PRIM device and clear the plot."""
+        if self._recording_state != "idle":
+            return
         try:
             # Clear the live pressure plot regardless of connection state
             if self.pressure_plot_widget and hasattr(
@@ -739,34 +684,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(msg, 3000)
         except Exception:
             log.exception("Failed to send zero command to Arduino")
-
-    @pyqtSlot()
-    def _on_start_pump(self):
-        """Send command to start the syringe pump without recording."""
-        try:
-            if self._serial_thread and self._serial_thread.isRunning():
-                self._serial_thread.send_command("L")
-                self.statusBar().showMessage("Pump start command sent.", 3000)
-            else:
-                self.statusBar().showMessage(
-                    "PRIM device not connected; cannot start pump.", 3000
-                )
-        except Exception:
-            log.exception("Failed to send start pump command")
-
-    @pyqtSlot()
-    def _on_stop_pump(self):
-        """Send command to stop the syringe pump."""
-        try:
-            if self._serial_thread and self._serial_thread.isRunning():
-                self._serial_thread.send_command("O")
-                self.statusBar().showMessage("Pump stop command sent.", 3000)
-            else:
-                self.statusBar().showMessage(
-                    "PRIM device not connected; cannot stop pump.", 3000
-                )
-        except Exception:
-            log.exception("Failed to send stop pump command")
 
     def _set_initial_control_states(self):
         if hasattr(self, "start_recording_action"):
@@ -838,153 +755,101 @@ class MainWindow(QMainWindow):
 
     # ─── Toggle Serial Connection ────────────────────────────────────────────
     def _toggle_serial_connection(self):
-        """
-        Toggle between Connect/Disconnect purely based on whether self._serial_thread
-        is running.  No extra flags needed.
+        if self._recording_state != "idle":
+            return
+        if self._serial_thread is not None:
+            self._serial_thread.stop()
+            self.connect_serial_action.setEnabled(False)
+            return
+        data = self.serial_port_combobox.currentData()
+        port = data.value() if isinstance(data, QVariant) else data
+        if not port:
+            QMessageBox.warning(self, "PRIM", "Select a serial port first.")
+            return
+        serial = SerialThread(port=port, parent=self)
+        self._serial_thread = serial
+        self._serial_counter = None
+        self._last_serial_activity = None
+        serial.data_ready.connect(self._handle_new_serial_data)
+        serial.error_occurred.connect(self._handle_serial_error)
+        serial.status_changed.connect(self._handle_serial_status_change)
+        serial.command_sent.connect(self._on_command_sent)
+        serial.finished.connect(self._handle_serial_thread_finished)
+        self.serial_port_combobox.setEnabled(False)
+        self.connect_serial_action.setEnabled(False)
+        serial.start()
 
-        - If _serial_thread is None or not running → start a new SerialThread,
-          immediately set the QAction to “Disconnect PRIM Device,” and disable the combo.
-        - Otherwise (thread is running) → stop it, set _serial_thread = None,
-          immediately flip QAction back to “Connect PRIM Device,” and re‐enable the combo.
-        """
-        # (1) If there is no running thread, go into “CONNECT” branch
-        if self._serial_thread is None or not self._serial_thread.isRunning():
-            # --- User clicked “Connect PRIM Device” ---
-            data = self.serial_port_combobox.currentData()
-            port = data.value() if isinstance(data, QVariant) else data
-
-            if port is None:
-                QMessageBox.warning(self, "Serial Connection", "Please select a port.")
-                return
-
-            log.info(f"Starting SerialThread on port: {port}")
-            try:
-                # If there is any leftover object, force‐stop and delete it
-                if self._serial_thread:
-                    if self._serial_thread.isRunning():
-                        self._serial_thread.stop()
-                        if not self._serial_thread.wait(1000):
-                            self._serial_thread.terminate()
-                            self._serial_thread.wait(500)
-                    self._serial_thread.deleteLater()
-                    self._serial_thread = None
-
-                # Create and start the new thread
-                self._serial_thread = SerialThread(port=port, parent=self)
-                self._serial_thread.data_ready.connect(self._handle_new_serial_data)
-                self._serial_thread.error_occurred.connect(self._handle_serial_error)
-                self._serial_thread.status_changed.connect(
-                    self._handle_serial_status_change
-                )
-                self._serial_thread.finished.connect(
-                    self._handle_serial_thread_finished
-                )
-                self._serial_thread.start()
-
-                # Immediately flip the QAction to “Disconnect PRIM Device”
-                self.connect_serial_action.setIcon(self.icon_disconnect)
-                self.connect_serial_action.setText("Disconnect PRIM Device")
-
-                # Disable the combo so they can’t switch mid‐stream
-                self.serial_port_combobox.setEnabled(False)
-
-            except Exception as e:
-                log.exception("Failed to start SerialThread.")
-                QMessageBox.critical(self, "Serial Error", str(e))
-                if self._serial_thread:
-                    self._serial_thread.deleteLater()
-                self._serial_thread = None
-                # Re‐enable the combo in case it got disabled
-                self.serial_port_combobox.setEnabled(True)
-                self._refresh_recording_button_states()
-
-        # (2) Otherwise, a thread is already running → go into “DISCONNECT” branch
-        else:
-            log.info("Stopping SerialThread on user request...")
-            try:
-                self._serial_thread.stop()
-            except Exception as e:
-                log.error(f"Error while stopping SerialThread: {e}")
-            try:
-                if self._serial_thread is not None:
-                    self._serial_thread.finished.disconnect(
-                        self._handle_serial_thread_finished
-                    )
-            except TypeError:
-                pass
-
-            # Immediately flip QAction back to “Connect PRIM Device”
-            self.connect_serial_action.setIcon(self.icon_connect)
-            self.connect_serial_action.setText("Connect PRIM Device")
-
-            # Re‐enable port-combo so they can pick another port
-            self.serial_port_combobox.setEnabled(True)
-
-            # Drop our reference so next click will “connect” again
-            self._serial_thread = None
-
-        # Finally, update the record‐button enable states (Start/Stop Recording)
+    def _handle_serial_status_change(self, status):
+        self._serial_active = status.startswith("Connected to ")
+        self.top_ctrl.update_connection_status(status, self._serial_active)
+        self.serial_status_label.setText("Serial: " + status)
+        self.connect_serial_action.setEnabled(self._recording_state == "idle")
+        if self._serial_active:
+            self.connect_serial_action.setText("Disconnect PRIM Device")
+            self.connect_serial_action.setIcon(self.icon_disconnect)
+        elif self._recording_state in ("preparing", "recording"):
+            self._handle_recorder_error("PRIM connection was lost")
         self._refresh_recording_button_states()
 
-    @pyqtSlot(str)
-    def _handle_serial_status_change(self, status: str):
-        log.info(f"Serial status: {status}")
-        self.statusBar().showMessage(f"PRIM Device: {status}", 4000)
-        self.serial_status_label.setText(f"Serial: {status}")
+    def _on_command_sent(self, command):
+        if command.startswith("<Z,"):
+            self._serial_counter = 0
+            if self._zero_before_start_pending:
+                self._zero_before_start_pending = False
+                if self._recording_state == "preparing":
+                    self._send_prim_start()
+        elif command.startswith("<G,") and self._recording_state == "preparing":
+            self._set_recording_state("recording")
+            self._serial_thread.set_idle_timeout_enabled(True)
+        elif command.startswith("<S,") and self._recording_state == "stopping":
+            self._stop_sent = True
+            self._request_recorder_stop()
 
-        connected_flag = (
-            "connected" in status.lower() or "opened serial port" in status.lower()
-        )
-        self.top_ctrl.update_connection_status(status, connected_flag)
-
-
+    def _handle_serial_error(self, message):
+        self.statusBar().showMessage("PRIM: " + message, 10000)
+        self._serial_active = False
+        self.top_ctrl.update_connection_status("Connection error", False)
+        if self._recording_state != "idle":
+            self._handle_recorder_error("PRIM: " + message)
+            self._request_recorder_stop()
         self._refresh_recording_button_states()
 
-    @pyqtSlot(str)
-    def _handle_serial_error(self, msg: str):
-        log.error(f"Serial error: {msg}")
-        hint = "Check the cable and selected port, then try reconnecting."
-        # Display brief guidance in the status bar as well
-        self.statusBar().showMessage(
-            f"Serial Error: {msg} — {hint}", 8000
-        )
-        self.serial_status_label.setText("Serial: Error")
-        self._show_error_dialog("Serial Connection Error", f"{msg}\n\n{hint}")
-        # Also re-evaluate whether the recording buttons are enabled
-        self._refresh_recording_button_states()
+    def _handle_recorder_error(self, message):
+        log.error("Recording: %s", message)
+        self.statusBar().showMessage(message, 10000)
+        if self._completion_summary is not None:
+            # A preview-restoration failure happens after files are closed.
+            # Preserve the acquisition result and report this separately.
+            summary = self._completion_summary
+            summary.setdefault("post_recording_issues", []).append(message)
+            path = summary.get("summary_path")
+            if path:
+                try:
+                    with open(path + ".tmp", "w", encoding="utf-8") as handle:
+                        json.dump(summary, handle, indent=2)
+                        handle.write("\n")
+                    os.replace(path + ".tmp", path)
+                except OSError as exc:
+                    log.error("Could not append cleanup information to recording summary: %s", exc)
+        elif self._recorder_worker is not None:
+            self.recording_issue.emit(message)
+        if self._recording_state in ("preparing", "recording"):
+            self._on_stop_recording()
 
-    @pyqtSlot(str)
-    def _handle_recorder_error(self, msg: str):
-        log.error(f"Recording error: {msg}")
-        hint = "Check disk space and file permissions."
-        self.statusBar().showMessage(
-            f"Recording Error: {msg} — {hint}", 8000
-        )
-        self.recording_status_label.setText("Not Recording")
-        self._show_error_dialog("Recording Error", f"{msg}\n\n{hint}")
-
-    @pyqtSlot()
     def _handle_serial_thread_finished(self):
-        log.info("SerialThread finished signal received.")
-        sender = self.sender()
-
-        if self._serial_thread is not None and sender == self._serial_thread:
-            # Clean up the thread object
-            self._serial_thread.deleteLater()
-            self._serial_thread = None
-
-            # Immediately flip QAction back to “Connect PRIM Device”
-            self.connect_serial_action.setIcon(self.icon_connect)
-            self.connect_serial_action.setText("Connect PRIM Device")
-            self.serial_port_combobox.setEnabled(True)
-
-            log.info("SerialThread instance cleaned up.")
-        else:
-            log.warning(
-                "Received 'finished' from an unknown/old SerialThread instance."
-            )
-
-        # Re‐evaluate “Start/Stop Recording” button states
+        serial = self._serial_thread
+        self._serial_thread = None
+        self._serial_active = False
+        self._serial_counter = None
+        self.connect_serial_action.setEnabled(True)
+        self.connect_serial_action.setText("Connect PRIM Device")
+        self.connect_serial_action.setIcon(self.icon_connect)
+        self.serial_port_combobox.setEnabled(True)
+        if serial:
+            serial.deleteLater()
+        if self._recording_state in ("preparing", "recording", "stopping"):
+            self._handle_recorder_error("PRIM transport stopped before recording finalized")
+            self._request_recorder_stop()
         self._refresh_recording_button_states()
 
     @pyqtSlot(int, float, float)
@@ -994,14 +859,21 @@ class MainWindow(QMainWindow):
         Pushes new data into TopControlPanel and the live plot.
         """
         # 1) Update TopControlPanel (frame count, device time, pressure)
+        self._serial_counter = idx
+        self._last_serial_activity = time.monotonic()
+        if self._recording_state == "preparing" and not self._start_sent:
+            self._handle_recorder_error("PRIM was already producing data before the recording start")
         self.top_ctrl.update_prim_data(idx, t, p)
 
         # 2) Read the auto-scale checkboxes from PlotControlPanel
         ax = self.plot_control_panel.auto_x_cb.isChecked()
         ay = self.plot_control_panel.auto_y_cb.isChecked()
 
-        # 3) Send the new sample to the PressurePlotWidget
-        self.pressure_plot_widget.update_plot(t, p, ax, ay)
+        # Keep the completed run available for review, including while idle
+        # serial status changes. Raw device timestamps still go to the writer.
+        if (self._start_sent and self._completion_summary is None
+                and self._recording_state in ("preparing", "recording", "stopping", "finalizing")):
+            self.pressure_plot_widget.update_plot(t, p, ax, ay)
 
         # 4) Also log it to the console dock if visible
         if self.dock_console.isVisible():
@@ -1017,7 +889,7 @@ class MainWindow(QMainWindow):
         """Return the recording settings currently selected in the UI."""
         fps = DEFAULT_FPS
         if self.camera_control_panel is not None:
-            selected_fps = self.camera_control_panel.framerate_spin.value()
+            selected_fps = self.camera_control_panel.sampling_spin.value()
             if selected_fps > 0:
                 fps = selected_fps
 
@@ -1039,349 +911,216 @@ class MainWindow(QMainWindow):
             settings.capture_setting_code,
         )
 
-    @pyqtSlot()
     def _on_start_recording(self):
-        """
-        Called when the user clicks ‘Start Recording’. Creates the next
-        PRIM_ROOT/YYYY-MM-DD/FillN folder and starts a RecordingManager
-        writing there.
-        """
+        if self._recording_state != "idle" or not self._serial_active:
+            return
         settings = self._current_recording_settings()
-        if settings.record_video and (
-            self.camera_thread is None or not self.camera_thread.isRunning()
-        ):
-            QMessageBox.warning(
-                self,
-                "Recording",
-                "Start the camera before recording video, or select Capture: None for CSV-only recording.",
-            )
+        if settings.record_video and not self._camera_ready:
+            QMessageBox.warning(self, "Recording", "Start the camera or choose Images: None for CSV-only recording.")
             return
-
-        outdir = get_next_fill_folder()
-        self._current_fill_folder = outdir
-        self._last_recording_paths = {"tiff": None, "csv": None}
+        if self._last_serial_activity is not None and time.monotonic() - self._last_serial_activity < max(0.5, 2 * settings.frame_interval_ms / 1000):
+            QMessageBox.warning(self, "PRIM is running", "Stop the manual PRIM run before starting a recording.")
+            return
+        try:
+            output_dir = get_next_fill_folder()
+        except Exception as exc:
+            self._show_error_dialog("Recording preparation", str(exc))
+            return
+        self._current_fill_folder = output_dir
         self._active_recording_settings = settings
-        if hasattr(self, "playback_action"):
-            self.playback_action.setEnabled(False)
-
-        fill_folder_name = os.path.basename(outdir)
-
-        # Create the recording thread + worker exactly as before:
-        self._recorder_thread = QThread(self)
-        self._recorder_worker = RecordingManager(
-            output_dir=outdir,
-            recording_fps=settings.recording_fps,
-            frame_interval_ms=settings.frame_interval_ms,
-            capture_setting_code=settings.capture_setting_code,
-            capture_setting_label=settings.capture_setting_label,
-            record_video=settings.record_video,
-        )
-        self._recorder_worker.moveToThread(self._recorder_thread)
-
-        # 7) Wire up thread start → worker.start_recording()
-        self._recorder_thread.started.connect(self._recorder_worker.start_recording)
-        #    and worker.finished → thread.quit() + worker.deleteLater()
-        self._recorder_worker.finished.connect(self._recorder_thread.quit)
-        self._recorder_worker.finished.connect(self._recorder_worker.deleteLater)
-        self._recorder_thread.finished.connect(self._recorder_thread.deleteLater)
-
-        # When the worker reports that it is ready for acquisition, send the
-        # start command to the Arduino.
-        self._recorder_worker.ready_for_acquisition.connect(self._on_recorder_ready)
-        self._recorder_worker.error_occurred.connect(self._handle_recorder_error)
-
-        # 8) Hook camera + serial into the worker:
-        self._serial_thread.data_ready.connect(self._recorder_worker.append_pressure)
+        self._run_id = uuid.uuid4().hex
+        self._start_sent = self._stop_sent = self._camera_armed = False
+        self._zero_before_start_pending = False
+        self._completion_summary = None
+        self._last_recording_paths = {"csv": None, "tiff": None}
+        self.pressure_plot_widget.clear_plot()
+        self._set_recording_state("preparing")
+        worker = RecordingManager(output_dir, settings.recording_fps, settings.frame_interval_ms,
+            settings.capture_setting_code, settings.capture_setting_label, settings.record_video,
+            run_id=self._run_id, initial_counter=0)
+        thread = QThread(self)
+        self._recorder_worker, self._recorder_thread = worker, thread
+        worker.moveToThread(thread)
+        thread.started.connect(worker.start_recording)
+        worker.ready_for_acquisition.connect(self._on_recorder_ready)
+        worker.activated.connect(self._on_recorder_activated)
+        worker.error_occurred.connect(self._handle_recorder_error)
+        worker.progress.connect(self._on_recording_progress)
+        worker.finalized.connect(self._on_recording_finalized)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_recorder_thread_finished)
+        self.activate_recorder.connect(worker.activate)
+        self.recording_issue.connect(worker.mark_incomplete)
+        self._serial_thread.data_ready.connect(worker.append_pressure)
         if settings.record_video:
-            self.camera_thread.frame_ready.connect(self._recorder_worker.append_frame)
+            self.camera_thread.recording_frame_ready.connect(worker.enqueue_frame, Qt.DirectConnection)
+        thread.start()
+        run_id = self._run_id
+        QTimer.singleShot(10000, lambda: self._preparation_deadline(run_id))
 
-        # 9) Kick off the recording thread:
-        self._recorder_thread.start()
+    def _toggle_recording(self):
+        if self._recording_state == "idle":
+            self._on_start_recording()
+        elif self._recording_state in ("preparing", "recording"):
+            self._on_stop_recording()
 
-        # Notify CameraControlPanel that recording has started
-        if self.camera_control_panel:
-            try:
-                self.camera_control_panel.set_recording_state(True)
-            except Exception:
-                log.exception("Failed to set camera recording state to True")
+    def _preparation_deadline(self, run_id):
+        if run_id == self._run_id and self._recording_state == "preparing":
+            self._handle_recorder_error("Recording preparation did not complete within 10 seconds")
 
-        # 10) Update UI buttons (disable “Start” / enable “Stop”):
+    def _set_recording_state(self, state):
+        self._recording_state = state
+        self.camera_control_panel.set_recording_state(state != "idle")
+        self.recording_status_label.setText({"idle": "Not Recording", "preparing": "Preparing…",
+            "recording": "Recording → " + os.path.basename(self._current_fill_folder or ""),
+            "stopping": "Stopping PRIM…", "finalizing": "Finalizing files…"}[state])
         self._refresh_recording_button_states()
-        self.recording_status_label.setText(f"Recording → {fill_folder_name}")
-        log.info(f"Recording started in {fill_folder_name}.")
 
-    @pyqtSlot()
     def _on_recorder_ready(self):
-        """Send the start command to the Arduino when recording setup is done."""
-        try:
-            if self._serial_thread:
-                if self._recorder_worker and not self._recorder_worker.is_recording:
-                    return
-                self._serial_thread.send_command(
-                    self._build_prim_command("G", self._active_recording_settings)
-                )
-                if hasattr(self._serial_thread, "set_idle_timeout_enabled"):
-                    self._serial_thread.set_idle_timeout_enabled(True)
-        except Exception:
-            log.exception("Failed to send start command to Arduino")
-
-    @pyqtSlot()
-    def _on_stop_recording(self):
-        """
-        Called when the user clicks ‘Stop Recording’. Sends the stop command
-        to the Arduino and requests the RecordingManager to finish once the
-        final sample and frame have been written.
-        """
-        # If there is no worker/thread, nothing to do.
-        if not self._recorder_worker or not self._recorder_thread:
+        if self._recording_state != "preparing":
+            self._request_recorder_stop()
             return
+        settings = self._active_recording_settings
+        if settings.record_video:
+            self._camera_ready = False
+            self.camera_thread.request_recording(self._run_id, settings.frame_interval_ms * settings.capture_setting_code / 1000.0)
+        else:
+            self._start_acquisition({"timing_mode": "csv_only"})
 
-        # Send stop command to the Arduino before disconnecting
-        try:
-            if self._serial_thread:
-                self._serial_thread.send_command(
-                    self._build_prim_command("S", self._active_recording_settings)
-                )
-                if hasattr(self._serial_thread, "set_idle_timeout_enabled"):
-                    self._serial_thread.set_idle_timeout_enabled(False)
-        except Exception:
-            log.exception("Failed to send stop command to Arduino")
+    def _start_acquisition(self, details):
+        if self._recording_state != "preparing":
+            return
+        if not self._serial_active or (self._active_recording_settings.record_video and not self._camera_armed):
+            self._handle_recorder_error("Camera or PRIM is no longer ready")
+            return
+        self.activate_recorder.emit(details)
 
-        # When the worker actually finishes, clean up our Python references and
-        # disconnect the data signals.
-        def _cleanup_recorder():
-            worker = self._recorder_worker
-            if self._serial_thread is not None and worker is not None:
-                try:
-                    self._serial_thread.data_ready.disconnect(
-                        worker.append_pressure
-                    )
-                except TypeError:
-                    pass
-            if self.camera_thread is not None and worker is not None:
-                try:
-                    self.camera_thread.frame_ready.disconnect(
-                        worker.append_frame
-                    )
-                except TypeError:
-                    pass
-            # At this point, worker has finished and thread has quit.
-            self._last_recording_paths["tiff"] = getattr(
-                worker, "_tiff_path", None
-            )
-            self._last_recording_paths["csv"] = getattr(
-                worker, "_csv_path", None
-            )
-            if hasattr(self, "playback_action"):
-                self.playback_action.setEnabled(True)
-            # We can delete both and clear our Python handles:
-            self._recorder_thread = None
-            self._recorder_worker = None
-            self._active_recording_settings = None
-            # If you need to update button states right away:
-            self._refresh_recording_button_states()
-            self._maybe_prompt_open_folder()
+    def _on_recorder_activated(self):
+        if self._recording_state != "preparing":
+            return
+        # Outputs and camera are ready. Zero the public counter/clock before G,
+        # using command_sent to preserve ordering (it is not a device ACK).
+        self._zero_before_start_pending = True
+        if not self._serial_thread.send_command(self._build_prim_command("Z", self._active_recording_settings)):
+            self._zero_before_start_pending = False
+            self._handle_recorder_error("Could not queue PRIM zero command")
+            self._request_recorder_stop()
 
-        # Connect the worker’s finished → cleanup slot
-        self._recorder_worker.finished.connect(_cleanup_recorder)
-        # Also, when the thread actually quits, call deleteLater on both objects:
-        self._recorder_worker.finished.connect(self._recorder_worker.deleteLater)
-        self._recorder_thread.finished.connect(self._recorder_thread.deleteLater)
+    def _send_prim_start(self):
+        self._start_sent = True
+        if not self._serial_thread.send_command(self._build_prim_command("G", self._active_recording_settings)):
+            self._handle_recorder_error("Could not queue PRIM start command")
+            self._request_recorder_stop()
 
-        # Tell the worker to stop after receiving the final packet
-        QMetaObject.invokeMethod(
-            self._recorder_worker, "request_stop", Qt.QueuedConnection
-        )
+    def _on_stop_recording(self):
+        if self._recording_state not in ("preparing", "recording"):
+            return
+        self._set_recording_state("stopping")
+        if self._serial_thread:
+            self._serial_thread.set_idle_timeout_enabled(False)
+        if self._start_sent and self._serial_thread:
+            if self._serial_thread.send_command(self._build_prim_command("S", self._active_recording_settings)):
+                run_id = self._run_id
+                QTimer.singleShot(1500, lambda: self._stop_deadline(run_id))
+                return
+            self.recording_issue.emit("PRIM stop could not be sent; use the device's manual stop")
+        self._request_recorder_stop()
 
-        # Notify CameraControlPanel that recording has stopped
-        if self.camera_control_panel:
+    def _stop_deadline(self, run_id):
+        if run_id == self._run_id and self._recording_state == "stopping" and not self._stop_sent:
+            self.recording_issue.emit("PRIM stop write was not confirmed; use the device's manual stop")
+            self._request_recorder_stop()
+
+    def _request_recorder_stop(self):
+        if self._recorder_worker is not None and self._recording_state != "idle":
+            self._set_recording_state("finalizing")
             try:
-                self.camera_control_panel.set_recording_state(False)
-            except Exception:
-                log.exception("Failed to set camera recording state to False")
+                QMetaObject.invokeMethod(self._recorder_worker, "request_stop", Qt.QueuedConnection)
+            except RuntimeError:
+                pass  # The finalized signal may already be queued for this worker.
 
-        # 4) Immediately update button states (the actual cleanup will happen in _cleanup_recorder)
-        self._refresh_recording_button_states()
-        self.recording_status_label.setText("Not Recording")
-        log.info("Stop recording requested.")
+    def _on_recording_progress(self, samples, images):
+        self.top_ctrl.images_lbl.setText(f"{images:,}")
+
+    def _on_recording_finalized(self, summary):
+        self._completion_summary = summary
+        self._last_recording_paths = {"csv": summary["csv_path"], "tiff": summary["tiff_path"] if summary["complete"] else None}
+        self.top_ctrl.images_lbl.setText(f"{summary['frames_written']:,}")
+        self._set_recording_state("finalizing")
+        if self.camera_thread and self.camera_thread.isRunning() and self._active_recording_settings.record_video:
+            self._preview_restoring = True
+            self.camera_thread.request_preview()
+
+    def _on_recorder_thread_finished(self):
+        thread = self._recorder_thread
+        self._recorder_worker = self._recorder_thread = None
+        if thread:
+            thread.deleteLater()
+        self._finish_recording_ui()
+
+    def _finish_recording_ui(self):
+        if self._completion_summary is None or self._recorder_thread is not None or self._preview_restoring:
+            return
+        summary, self._completion_summary = self._completion_summary, None
+        self._active_recording_settings = None
+        self._run_id = None
+        self._set_recording_state("idle")
+        dialog = RecordingCompletionDialog(summary, self)
+        self._completion_dialog = dialog
+        dialog.playback_requested.connect(self.open_playback_window)
+        dialog.finished.connect(self._on_completion_closed)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.open()
+
+    def _on_completion_closed(self, result):
+        self._completion_dialog = None
+        if self._closing:
+            self.close()
 
     def _refresh_recording_button_states(self):
-        """
-        Enable “Start Recording” only if serial is connected and no recorder thread is running.
-        Enable “Stop Recording” only if a RecordingManager thread is active.
-        """
-        serial_ready = (
-            self._serial_thread is not None and self._serial_thread.isRunning()
-        )
-        recorder_running = (
-            self._recorder_thread is not None and self._recorder_thread.isRunning()
-        )
-        can_start = serial_ready and not recorder_running
-        can_stop = recorder_running
-
+        if not hasattr(self, "start_recording_action"):
+            return
+        settings = self._current_recording_settings()
+        idle = self._recording_state == "idle"
+        can_start = idle and self._serial_active and (not settings.record_video or self._camera_ready) and not self._closing
+        can_stop = self._recording_state in ("preparing", "recording")
         self.start_recording_action.setEnabled(can_start)
         self.stop_recording_action.setEnabled(can_stop)
+        self.top_ctrl.set_recording_state(self._recording_state, can_start or can_stop)
+        self.btn_start_camera.setEnabled(idle)
+        if hasattr(self, "connect_serial_action"):
+            self.connect_serial_action.setEnabled(idle)
+            self.refresh_action.setEnabled(idle and self.camera_thread is None and self._serial_thread is None)
+            self.playback_action.setEnabled(idle and bool(self._last_recording_paths.get("tiff")))
+        port = self._serial_thread.port if self._serial_thread else "Disconnected"
+        self.top_ctrl.set_acquisition_details(f"{port} · 115200 baud · Pressure {1000 / settings.frame_interval_ms:g} Hz "
+            f"({settings.frame_interval_ms} ms) · Images: {settings.capture_setting_label} · "
+            + ("Arduino external trigger" if settings.record_video else "CSV only"))
 
     # ─── Window Close Cleanup ──────────────────────────────────────────────────
     def closeEvent(self, event):
-        log.info("MainWindow closeEvent triggered.")
-
-        # 1) If RecordingManager is still running, request a graceful stop and wait.
-        if self._recorder_worker and self._recorder_thread:
-            if self._recorder_thread.isRunning():
-                log.info("Stopping RecordingManager...")
-                # Ask the worker to stop via queued call
-                QMetaObject.invokeMethod(
-                    self._recorder_worker, "request_stop", Qt.QueuedConnection
-                )
-                # Wait up to 3 seconds for it to finish
-                if not self._recorder_thread.wait(3000):
-                    log.warning(
-                        "RecordingManager thread did not stop gracefully; forcing terminate."
-                    )
-                    try:
-                        self._recorder_thread.terminate()
-                    except Exception:
-                        pass
-                    self._recorder_thread.wait(500)
-
-        # Now that the thread is done, delete both worker and thread objects if they exist
-        if self._recorder_worker:
-            try:
-                self._recorder_worker.deleteLater()
-            except Exception:
-                pass
-            self._recorder_worker = None
-
-        if self._recorder_thread:
-            try:
-                self._recorder_thread.deleteLater()
-            except Exception:
-                pass
-            self._recorder_thread = None
-
-        # 2) Stop the serial thread (if it exists)
-        if self._serial_thread:
-            try:
-                if self._serial_thread.isRunning():
-                    log.info("Stopping SerialThread...")
-                    self._serial_thread.stop()  # assume your SerialThread has a stop() method
-                    if not self._serial_thread.wait(1500):
-                        log.warning(
-                            "SerialThread did not stop gracefully; forcing terminate."
-                        )
-                        try:
-                            self._serial_thread.terminate()
-                        except Exception:
-                            pass
-                        self._serial_thread.wait(500)
-
-                try:
-                    self._serial_thread.finished.disconnect(
-                        self._handle_serial_thread_finished
-                    )
-                except TypeError:
-                    pass
-
-            except RuntimeError:
-                # The QThread object might already be deleted; ignore
-                pass
-            finally:
-                try:
-                    self._serial_thread.deleteLater()
-                except Exception:
-                    pass
-                self._serial_thread = None
-
-        # 3) Stop the camera thread (if it exists)
-        cam_thread = self.camera_thread
-        if cam_thread:
-            try:
-                if cam_thread.isRunning():
-                    log.info("Stopping SDKCameraThread...")
-                    cam_thread.stop()  # assume your SDKCameraThread has a stop() method
-                    if not cam_thread.wait(1500):
-                        log.warning(
-                            "SDKCameraThread did not stop gracefully; forcing terminate."
-                        )
-                        try:
-                            cam_thread.terminate()
-                        except Exception:
-                            pass
-                        cam_thread.wait(500)
-            except RuntimeError:
-                # The QThread object might already be deleted; ignore
-                pass
-            finally:
-                try:
-                    cam_thread.deleteLater()
-                except Exception:
-                    pass
-                self.camera_thread = None
-
-        # 4) Clear UI elements that might hold references
-        try:
-            self.device_combo.clear()
-        except Exception:
-            pass
-
-        # Explicitly release IC4-related objects before shutting down the library
-        try:
-            if hasattr(self, "camera_thread") and self.camera_thread:
-                if hasattr(self.camera_thread, "grabber"):
-                    del self.camera_thread.grabber
-                if hasattr(self.camera_thread, "_sink"):
-                    del self.camera_thread._sink
-                if hasattr(self.camera_thread, "_device_info"):
-                    del self.camera_thread._device_info
-        except Exception:
-            pass
-        try:
-            from imagingcontrol4.library import Library
-
-            Library.shutdown()
-        except Exception:
-            pass
-
-        # 5) Process any remaining events, then call the base implementation
-        QApplication.processEvents()
-        log.info("All threads cleaned up. Proceeding with close.")
+        self._closing = True
+        if self._completion_dialog is not None:
+            event.ignore()
+            return
+        if self._recording_state != "idle":
+            event.ignore()
+            self._on_stop_recording()
+            return
+        active = False
+        for thread in (self.camera_thread, self._serial_thread, self._recorder_thread):
+            if thread is not None and thread.isRunning():
+                active = True
+                thread.stop() if hasattr(thread, "stop") else thread.quit()
+        if active:
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
         super().closeEvent(event)
 
-    def _maybe_prompt_open_folder(self):
-        """Ask to open the last recording folder when recording stops."""
-        if not self._current_fill_folder:
-            return
-
-        if not self._open_folder_prompt:
-            return
-
-        checkbox = QCheckBox("Never ask again")
-        mbox = QMessageBox(
-            QMessageBox.Question,
-            "Open Results Folder",
-            "Open the folder where the files were saved?",
-            QMessageBox.Yes | QMessageBox.No,
-            self,
-        )
-        mbox.setCheckBox(checkbox)
-        choice = mbox.exec_()
-
-        if checkbox.isChecked():
-            self._open_folder_prompt = False
-            save_app_setting(SETTING_OPEN_FOLDER_PROMPT, False)
-
-        if choice == QMessageBox.Yes:
-            path = self._current_fill_folder
-            try:
-                if sys.platform.startswith("win"):
-                    os.startfile(path)
-                elif sys.platform == "darwin":
-                    subprocess.Popen(["open", path])
-                else:
-                    subprocess.Popen(["xdg-open", path])
-            except Exception as e:
-                log.error(f"Failed to open folder {path}: {e}")
 
     def open_playback_window(self, ask_user=False):
         """Open a :class:`PlaybackWindow` with the last recording or ask for files."""

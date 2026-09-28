@@ -43,7 +43,7 @@ SERIAL_COMMAND_TERMINATOR = b"\n"  # Arduino uses Serial.println()
 
 # ─── Application info ───────────────────────────────────────────────────────────
 APP_NAME = "PRIMA"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.5.0"
 ABOUT_TEXT = f"""
 <strong>{APP_NAME} v{APP_VERSION}</strong>
 <p>Passive Data Logger and Viewer for the PRIM system.</p>
@@ -63,6 +63,6 @@ PLOT_DEFAULT_Y_MAX = 30  # Typical pressure range in mmHg
 
 # ─── Camera profiles / Application config directory ─────────────────────────────
 # User‐writable directory for storing camera profiles
-APP_CONFIG_DIR = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
+APP_CONFIG_DIR = os.environ.get("PRIMA_CONFIG_DIR") or QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
 CAMERA_PROFILES_DIR = os.path.join(APP_CONFIG_DIR, "camera_profiles")
 QDir().mkpath(CAMERA_PROFILES_DIR)

@@ -1,11 +1,21 @@
 # File: prim_app/prim_app.py
 
 import sys
+
+# Run the isolated adapter helper before importing Qt, NumPy or camera SDKs.
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--prima-mm-worker":
+    from cameras.micro_manager_process import worker_main
+    worker_main(int(sys.argv[2]))
+    sys.exit(0)
+
 import os
 import re
 import traceback
 import logging
-import imagingcontrol4 as ic4
+try:
+    import imagingcontrol4 as ic4
+except Exception:
+    ic4 = None  # Other camera connections and pressure-only recording remain usable.
 
 from PyQt5.QtWidgets import QApplication, QMessageBox, QStyleFactory
 from PyQt5.QtCore import Qt, QCoreApplication
@@ -127,14 +137,15 @@ def main_app_entry():
 
     # ─── Initialize IC4 globally so MainWindow can enumerate devices ─────────
     try:
+        if ic4 is None:
+            raise RuntimeError("IC4 is not installed or its runtime is unavailable")
         ic4.Library.init(
             api_log_level=ic4.LogLevel.INFO, log_targets=ic4.LogTarget.STDERR
         )
         log.info("Global IC4 Library.init() succeeded.")
     except Exception as e:
         log.error(f"Could not initialize IC4 in main thread: {e}")
-        # You might still allow the UI to start (with an empty device list),
-        # or choose to exit right here with sys.exit(1).
+        # IC4 is optional; Micro-Manager and pressure-only recording still work.
 
     # Create the QApplication
     app = QApplication(sys.argv)

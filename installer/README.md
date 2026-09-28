@@ -27,7 +27,7 @@ installer\build_installer.bat
 The script builds the PyInstaller app first, then creates:
 
 ```text
-installer\output\PRIMA-Setup-3.0.0.exe
+installer\output\PRIMA-Setup-3.5.0.exe
 ```
 
 The installer includes the PyInstaller app from:
@@ -74,5 +74,5 @@ where /r "%ProgramFiles%" ISCC.exe
 
 The installer is usable without signing, but Windows SmartScreen may warn users.
 For a more official release, sign
-`installer\output\PRIMA-Setup-3.0.0.exe` with a Windows code-signing
+`installer\output\PRIMA-Setup-3.5.0.exe` with a Windows code-signing
 certificate.
