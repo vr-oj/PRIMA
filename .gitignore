@@ -50,3 +50,4 @@ prim_app/last_run.txt
 *.zip
 prim_app/configs/MMConfig_ThorLabsCam.cfg
 /Beta features/testenv
+/installer/output
